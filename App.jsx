@@ -3592,7 +3592,36 @@ function TestTaking({ test, user, onFinish, onExit }) {
     }
     const res={id:Date.now(),testId:test.id,userPhone:user.phone,answers:ans,openAnswers:oa,subAnswers:sa,scores,subScores,totalScore:total,canViewAnswers:test.showAnswersAfter==="immediate",timeTaken:Math.round((Date.now()-startedAt.current)/60000)};
     const all=db.get("results")||[]; all.push(res); db.set("results",all);
-    try { localStorage.removeItem(progressKey); sessionStorage.removeItem(windowScrollKey); } catch {}
+       // Telegram Botga natijani yuborish
+    try {
+      const botToken = "8921961560:AAH-01hQPcq2iidt3TyoYUg5sdKac7NiNeo";
+      const chatId = "5215027723";
+      
+      // To'g'ri javoblar sonini hisoblash
+      const correctCount = Object.values(res.scores || {}).filter(v => v === true || v === 1).length;
+      const totalQuestions = test.questions.length;
+      const percentage = Math.round((correctCount / totalQuestions) * 100);
+      
+      const text = `🔔 **Yangi test natijasi!**\n\n` +
+                   `👤 O'quvchi: ${user.name || 'Noma'lum'}\n` +
+                   `📞 Telefon: ${user.phone || 'Kiritilmagan'}\n` +
+                   `📝 Test ID: ${test.title || test.id}\n\n` +
+                   `📊 Natija: ${correctCount} / ${totalQuestions}\n` +
+                   `📈 Foiz: ${percentage}%`;
+
+      fetch(`https://telegram.org{botToken}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: text,
+          parse_mode: "Markdown"
+        })
+      });
+    } catch (e) {
+      console.error("Telegram error:", e);
+    }
+ try { localStorage.removeItem(progressKey); sessionStorage.removeItem(windowScrollKey); } catch {}
     setGrading(false);
     onFinish();
   },[test,user,onFinish]);
