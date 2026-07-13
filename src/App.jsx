@@ -688,12 +688,12 @@ const ADMIN_PW = "admin123";
 // bo'limidan olingan konfiguratsiyani shu yerga qo'ying. Agar bo'sh qoldirilsa,
 // sayt avvalgidek faqat shu qurilmaning localStorage'ida ishlayveradi (Firebase o'chiq).
 const FIREBASE_CONFIG = {
-  apiKey: "",
-  authDomain: "",
-  projectId: "",
-  storageBucket: "",
-  messagingSenderId: "",
-  appId: "",
+  apiKey: "AIzaSyCGpYIBW_TWHwyl-ddjbQ6TDjARKpgXn3k",
+  authDomain: "math-platform-2dc2a.firebaseapp.com",
+  projectId: "math-platform-2dc2a",
+  storageBucket: "math-platform-2dc2a.firebasestorage.app",
+  messagingSenderId: "109909968975",
+  appId: "1:109909968975:web:7b5c4ba4a80a54085ac23a",
 };
 const FIREBASE_SYNC_COLLECTIONS = ["users", "tests", "results"];
 
@@ -2441,7 +2441,7 @@ function TestCreator({ existing, onSave, onCancel }) {
     const wasActive = existing?.active||false;
     // Agar rejalashtirilgan vaqt kelajakda bo'lsa va test hali qo'lda faollashtirilmagan bo'lsa, uni nofaol holatda saqlaymiz — vaqt kelganda avtomatik faollashadi.
     const willAutoStart = schedTs && schedTs > Date.now() && !wasActive;
-    onSave({id:existing?.id||Date.now(),name,duration,closedCount:questions.filter(q=>q.type==="closed").length,optionsCount:sections[0]?typeOpts(sections[0].type):4,sections,questions,active:willAutoStart?false:wasActive,scheduledAt:schedTs,showAnswersAfter:showAnswers,showStats,startedAt:existing?.startedAt||null,pdfUrl:docType==="pdf"?pdfUrl:null,latexSource:docType==="latex"?latexSource:null,latexFileName:docType==="latex"?latexFileName:null,latexImages:docType==="latex"?latexImages:null,accessCode:requireCode?accessCode.trim().toUpperCase():null,codePrice:requireCode?codePrice:null,showStats});
+    onSave({id:existing?.id||Date.now(),name,duration,closedCount:questions.filter(q=>q.type==="closed").length,optionsCount:sections[0]?typeOpts(sections[0].type):4,sections,questions,active:willAutoStart?false:wasActive,scheduledAt:schedTs,showAnswersAfter:showAnswers,showStats,startedAt:existing?.startedAt||null,pdfUrl:docType==="pdf"?pdfUrl:null,latexSource:docType==="latex"?latexSource:null,latexFileName:docType==="latex"?latexFileName:null,latexImages:docType==="latex"?latexImages:null,accessCode:requireCode?accessCode.trim().toUpperCase():null,codePrice:requireCode?codePrice:null});
   };
 
   const grouped=()=>{
