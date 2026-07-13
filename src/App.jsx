@@ -680,8 +680,8 @@ function MathInputField({ value, onFocus, style, placeholder, active }) {
 }
 
 // ===== STORAGE =====
-const ADMIN_LOGIN = "admin";
-const ADMIN_PW = "admin123";
+const ADMIN_LOGIN = "Dilshod_11";
+const ADMIN_PW = "Dilshod_11";
 
 // ===== 🔧 FIREBASE SOZLASH =====
 // console.firebase.google.com da loyiha yarating → Project settings → Your apps → Web (</>)
@@ -2623,12 +2623,12 @@ function TestCreator({ existing, onSave, onCancel }) {
             </div>
           </label>
 
-          {/* Pullik test / Kirish kodi */}
+          {/* Maxfiy test / Kirish kodi */}
           <div style={{background:"#FFFBEB",border:"1.5px solid #FDE68A",borderRadius:12,padding:14,marginBottom:16}}>
             <label style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",marginBottom:requireCode?12:0}}>
               <input type="checkbox" checked={requireCode} onChange={e=>setRequireCode(e.target.checked)}
                 style={{width:20,height:20,accentColor:"#F59E0B",cursor:"pointer"}}/>
-              <span style={{fontWeight:700,color:"#92400E",fontSize:14}}>🔒 Pullik test (kirish kodi talab qilinsin)</span>
+              <span style={{fontWeight:700,color:"#92400E",fontSize:14}}>🔒 Maxfiy test (kirish kodi talab qilinsin)</span>
             </label>
             {requireCode && (
               <div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:10}}>
@@ -3033,7 +3033,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
               }, 0);
               return (
                 <div style={{...S.card,padding:16,marginBottom:16,background:"linear-gradient(135deg,#FEF3C7,#FFFBEB)",border:"1.5px solid #FDE68A"}}>
-                  <p style={{margin:"0 0 4px",color:"#92400E",fontSize:13,fontWeight:700}}>💰 Pullik testlardan tushum (taxminiy)</p>
+                  <p style={{margin:"0 0 4px",color:"#92400E",fontSize:13,fontWeight:700}}>💰 Maxfiy testlardan tushum (taxminiy)</p>
                   <p style={{margin:0,color:"#92400E",fontSize:28,fontWeight:900}}>{totalRevenue.toLocaleString()} so'm</p>
                 </div>
               );
@@ -3157,12 +3157,12 @@ function StudentDashboard({ user, onLogout }) {
           <div style={{...S.card,padding:28,maxWidth:380,width:"100%"}}>
             <div style={{textAlign:"center",marginBottom:16}}>
               <div style={{fontSize:44}}>🔒</div>
-              <h3 style={{margin:"8px 0 4px",fontSize:18}}>Pullik test</h3>
+              <h3 style={{margin:"8px 0 4px",fontSize:18}}>Maxfiy test</h3>
               <p style={{margin:0,color:C.textMid,fontSize:14}}>{codeModal.name}</p>
               {codeModal.codePrice&&<p style={{margin:"6px 0 0",color:"#92400E",fontWeight:700,fontSize:16}}>{codeModal.codePrice} so'm</p>}
             </div>
             <p style={{color:C.textMid,fontSize:13,textAlign:"center",marginBottom:14}}>
-              Testga kirish uchun to'lov qiling va sizga berilgan kodni kiriting.
+              Testga kirish uchun  sizga berilgan kodni kiriting.
             </p>
             {codeErr&&<div style={S.err}>{codeErr}</div>}
             <input value={codeInput} onChange={e=>setCodeInput(e.target.value.toUpperCase())}
