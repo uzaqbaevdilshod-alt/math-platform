@@ -680,8 +680,8 @@ function MathInputField({ value, onFocus, style, placeholder, active }) {
 }
 
 // ===== STORAGE =====
-const ADMIN_LOGIN = "Dilshod_11";
-const ADMIN_PW = "Dilshod_11";
+const ADMIN_LOGIN = "admin";
+const ADMIN_PW = "admin123";
 
 // ===== 🔧 FIREBASE SOZLASH =====
 // console.firebase.google.com da loyiha yarating → Project settings → Your apps → Web (</>)
@@ -2250,7 +2250,7 @@ function LoginPage({ onLogin, onRegister, onAdmin }) {
       </div>
       {err&&<div style={S.err}>{err}</div>}
       <label style={S.label}>Login (telefon raqam)</label>
-      <input value={login} onChange={e=>setLogin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&go()} style={S.input} placeholder="+998901234567 yoki login"/>
+      <input value={login} onChange={e=>setLogin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&go()} style={S.input} placeholder="+998901234567 yoki admin"/>
       <label style={S.label}>Parol</label>
       <div style={{position:"relative"}}>
         <input type={showPwd?"text":"password"} value={pwd} onChange={e=>setPwd(e.target.value)} onKeyDown={e=>e.key==="Enter"&&go()}
@@ -2287,7 +2287,7 @@ function RegisterPage({ onDone, onLogin }) {
     <AuthLayout>
       <div style={{textAlign:"center",marginBottom:24}}><div style={{fontSize:52}}>📝</div><h1 style={{margin:"8px 0 0",fontSize:22,fontWeight:800}}>Ro'yxatdan O'tish</h1></div>
       {err&&<div style={S.err}>{err}</div>}
-      {[["firstName","Ism"],["lastName","Familiya"],["group","Guruh/Sinf"],["phone","Telefon raqam (login)"]].map(([k,ph])=>(
+      {[["firstName","Ism"],["lastName","Familiya"],["group","Guruh/Sinf (10-A)"],["phone","Telefon raqam (login)"]].map(([k,ph])=>(
         <div key={k}><label style={S.label}>{ph}</label><input value={f[k]} onChange={e=>setF({...f,[k]:e.target.value})} style={S.input} placeholder={ph}/></div>
       ))}
       <label style={S.label}>Parol</label>
@@ -2460,7 +2460,7 @@ function TestCreator({ existing, onSave, onCancel }) {
       {step===1&&(
         <div>
           <label style={S.label}>Test nomi</label>
-          <input value={name} onChange={e=>setName(e.target.value)} style={S.input} placeholder="Test nomi"/>
+          <input value={name} onChange={e=>setName(e.target.value)} style={S.input} placeholder="Algebra imtihoni"/>
 
           {/* PDF / LaTeX upload */}
           <label style={S.label}>📄 Test varianti (ixtiyoriy)</label>
@@ -2623,12 +2623,12 @@ function TestCreator({ existing, onSave, onCancel }) {
             </div>
           </label>
 
-          {/* Maxfiy test / Kirish kodi */}
+          {/* Pullik test / Kirish kodi */}
           <div style={{background:"#FFFBEB",border:"1.5px solid #FDE68A",borderRadius:12,padding:14,marginBottom:16}}>
             <label style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",marginBottom:requireCode?12:0}}>
               <input type="checkbox" checked={requireCode} onChange={e=>setRequireCode(e.target.checked)}
                 style={{width:20,height:20,accentColor:"#F59E0B",cursor:"pointer"}}/>
-              <span style={{fontWeight:700,color:"#92400E",fontSize:14}}>🔒 Maxfiy test (kirish kodi talab qilinsin)</span>
+              <span style={{fontWeight:700,color:"#92400E",fontSize:14}}>🔒 Pullik test (kirish kodi talab qilinsin)</span>
             </label>
             {requireCode && (
               <div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:10}}>
@@ -3157,12 +3157,12 @@ function StudentDashboard({ user, onLogout }) {
           <div style={{...S.card,padding:28,maxWidth:380,width:"100%"}}>
             <div style={{textAlign:"center",marginBottom:16}}>
               <div style={{fontSize:44}}>🔒</div>
-              <h3 style={{margin:"8px 0 4px",fontSize:18}}>Maxfiy test</h3>
+              <h3 style={{margin:"8px 0 4px",fontSize:18}}>Pullik test</h3>
               <p style={{margin:0,color:C.textMid,fontSize:14}}>{codeModal.name}</p>
               {codeModal.codePrice&&<p style={{margin:"6px 0 0",color:"#92400E",fontWeight:700,fontSize:16}}>{codeModal.codePrice} so'm</p>}
             </div>
             <p style={{color:C.textMid,fontSize:13,textAlign:"center",marginBottom:14}}>
-              Testga kirish uchun sizga berilgan kodni kiriting.
+              Testga kirish uchun to'lov qiling va sizga berilgan kodni kiriting.
             </p>
             {codeErr&&<div style={S.err}>{codeErr}</div>}
             <input value={codeInput} onChange={e=>setCodeInput(e.target.value.toUpperCase())}
@@ -3592,7 +3592,7 @@ function TestTaking({ test, user, onFinish, onExit }) {
     }
     const res={id:Date.now(),testId:test.id,userPhone:user.phone,answers:ans,openAnswers:oa,subAnswers:sa,scores,subScores,totalScore:total,canViewAnswers:test.showAnswersAfter==="immediate",timeTaken:Math.round((Date.now()-startedAt.current)/60000)};
     const all=db.get("results")||[]; all.push(res); db.set("results",all);
- try { localStorage.removeItem(progressKey); sessionStorage.removeItem(windowScrollKey); } catch {}
+    try { localStorage.removeItem(progressKey); sessionStorage.removeItem(windowScrollKey); } catch {}
     setGrading(false);
     onFinish();
   },[test,user,onFinish]);
