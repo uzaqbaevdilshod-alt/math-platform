@@ -776,6 +776,16 @@ function initDB() {
   autoActivateScheduledTests();
 }
 
+// ===== SESSIYANI ESLAB QOLISH =====
+// Login/parolni har safar qayta so'ramaslik uchun — bir marta kirgan
+// foydalanuvchi (o'quvchi/admin/o'qituvchi) qurilmada eslab qolinadi.
+// Telegram Mini App har ochilishida sahifa "yangi holatda" boshlangani
+// uchun bu ayniqsa muhim (aks holda har safar qaytadan login so'raladi).
+const SESSION_KEY = "app_session_v1";
+function saveSession(s) { try { localStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch {} }
+function loadSession() { try { return JSON.parse(localStorage.getItem(SESSION_KEY)); } catch { return null; } }
+function clearSession() { try { localStorage.removeItem(SESSION_KEY); } catch {} }
+
 // ===== SCHEDULED TEST AUTO-ACTIVATION =====
 // Har bir testda ixtiyoriy `scheduledAt` (ms timestamp) bo'lishi mumkin — admin
 // testni oldindan yuklab, qachon boshlanishini belgilab qo'yadi. Belgilangan vaqt
@@ -1360,6 +1370,42 @@ async function checkMathAsync(correct, student) {
 
 // Also used for real-time display in calculator
 function normForMathJs(s) { return toMathJs(s); }
+
+// ===== QAYTA BAHOLASH =====
+// Test topshirilganda javoblar (o'quvchining tanlagan/yozgan xom javoblari) doim
+// saqlanadi. Admin keyinroq to'g'ri javob kalitini tuzatsa, shu xom javoblarni
+// YANGI kalit bilan qayta solishtirib, natijalarni to'g'rilash mumkin.
+async function regradeTestResults(test) {
+  const all = db.get("results") || [];
+  let changed = 0;
+  const updated = [];
+  for (const r of all) {
+    if (r.testId !== test.id) { updated.push(r); continue; }
+    const scores = {}, subScores = {};
+    let total = 0;
+    for (let idx = 0; idx < test.questions.length; idx++) {
+      const q = test.questions[idx];
+      if (q.type === "closed") {
+        const ok = r.answers?.[idx] !== undefined && r.answers[idx] === q.correctAnswer;
+        scores[idx] = ok; if (ok) total++;
+      } else if (q.subParts?.length > 0) {
+        subScores[idx] = {};
+        for (let si = 0; si < q.subParts.length; si++) {
+          const sp = q.subParts[si];
+          const ok = await checkMathAsync(sp.answer, r.subAnswers?.[idx]?.[si] || "");
+          subScores[idx][si] = ok; if (ok) total++;
+        }
+      } else {
+        const ok = await checkMathAsync(q.correctAnswer, r.openAnswers?.[idx] || "");
+        scores[idx] = ok; if (ok) total++;
+      }
+    }
+    changed++;
+    updated.push({ ...r, scores, subScores, totalScore: total });
+  }
+  db.set("results", updated);
+  return changed;
+}
 
 // ===== EXCEL EXPORT (SheetJS .xlsx) =====
 // Ma'lumotni tayyorlab, DATA URL qaytaradi (avtomatik yuklab olishga urinmaydi).
@@ -2287,7 +2333,7 @@ function RegisterPage({ onDone, onLogin }) {
     <AuthLayout>
       <div style={{textAlign:"center",marginBottom:24}}><div style={{fontSize:52}}>📝</div><h1 style={{margin:"8px 0 0",fontSize:22,fontWeight:800}}>Ro'yxatdan O'tish</h1></div>
       {err&&<div style={S.err}>{err}</div>}
-      {[["firstName","Ism"],["lastName","Familiya"],["group","Guruh/Sinf (10-A)"],["phone","Telefon raqam (login)"]].map(([k,ph])=>(
+      {[["firstName","Ism"],["lastName","Familiya"],["group","Guruh"],["phone","Telefon raqam (login)"]].map(([k,ph])=>(
         <div key={k}><label style={S.label}>{ph}</label><input value={f[k]} onChange={e=>setF({...f,[k]:e.target.value})} style={S.input} placeholder={ph}/></div>
       ))}
       <label style={S.label}>Parol</label>
@@ -2326,6 +2372,22 @@ function TestCreator({ existing, onSave, onCancel }) {
   const [step,setStep]=useState(existing?2:1);
   const [err,setErr]=useState("");
   const [kbdOpen,setKbdOpen]=useState(null); // {qIdx, sub}
+  const [restrictGroups,setRestrictGroups]=useState(!!(existing?.targetGroups && existing.targetGroups.length>0));
+  const [targetGroups,setTargetGroups]=useState(existing?.targetGroups || []); // [] = barcha guruhlarga ko'rinadi
+  const [customGroupInput,setCustomGroupInput]=useState("");
+  const allGroups = useMemo(() => {
+    const users = db.get("users") || [];
+    const set = new Set(users.map(u=>u.group).filter(Boolean));
+    (existing?.targetGroups||[]).forEach(g=>set.add(g));
+    return [...set].sort();
+  }, []);
+  const toggleGroup = (g) => setTargetGroups(prev => prev.includes(g) ? prev.filter(x=>x!==g) : [...prev, g]);
+  const addCustomGroup = () => {
+    const g = customGroupInput.trim();
+    if (!g) return;
+    if (!targetGroups.includes(g)) setTargetGroups(prev=>[...prev, g]);
+    setCustomGroupInput("");
+  };
 
   const typeOpts=(t)=>({closed2:2,closed3:3,closed4:4,closed5:5,closed6:6,closed7:7,closed8:8,open:0})[t]||4;
   const typeLabel=(t)=>({closed2:"2 variant",closed3:"3 variant",closed4:"4 variant (A-D)",closed5:"5 variant (A-E)",closed6:"6 variant",closed7:"7 variant",closed8:"8 variant",open:"Ochiq (yozma)"})[t]||t;
@@ -2437,11 +2499,12 @@ function TestCreator({ existing, onSave, onCancel }) {
   const save=()=>{
     if(!name.trim()){setErr("Test nomini kiriting!");return;}
     if(requireCode && !accessCode.trim()){setErr("Kirish kodini kiriting yoki tasodifiy yarating!");return;}
+    if(restrictGroups && targetGroups.length===0){setErr("Kamida bitta guruhni tanlang yoki \"Barcha guruhlarga\" ni belgilang!");return;}
     const schedTs = localInputToTs(scheduledAt);
     const wasActive = existing?.active||false;
     // Agar rejalashtirilgan vaqt kelajakda bo'lsa va test hali qo'lda faollashtirilmagan bo'lsa, uni nofaol holatda saqlaymiz — vaqt kelganda avtomatik faollashadi.
     const willAutoStart = schedTs && schedTs > Date.now() && !wasActive;
-    onSave({id:existing?.id||Date.now(),name,duration,closedCount:questions.filter(q=>q.type==="closed").length,optionsCount:sections[0]?typeOpts(sections[0].type):4,sections,questions,active:willAutoStart?false:wasActive,scheduledAt:schedTs,showAnswersAfter:showAnswers,showStats,startedAt:existing?.startedAt||null,pdfUrl:docType==="pdf"?pdfUrl:null,latexSource:docType==="latex"?latexSource:null,latexFileName:docType==="latex"?latexFileName:null,latexImages:docType==="latex"?latexImages:null,accessCode:requireCode?accessCode.trim().toUpperCase():null,codePrice:requireCode?codePrice:null});
+    onSave({id:existing?.id||Date.now(),name,duration,closedCount:questions.filter(q=>q.type==="closed").length,optionsCount:sections[0]?typeOpts(sections[0].type):4,sections,questions,active:willAutoStart?false:wasActive,scheduledAt:schedTs,showAnswersAfter:showAnswers,showStats,startedAt:existing?.startedAt||null,pdfUrl:docType==="pdf"?pdfUrl:null,latexSource:docType==="latex"?latexSource:null,latexFileName:docType==="latex"?latexFileName:null,latexImages:docType==="latex"?latexImages:null,accessCode:requireCode?accessCode.trim().toUpperCase():null,codePrice:requireCode?codePrice:null,targetGroups:restrictGroups?targetGroups:[]});
   };
 
   const grouped=()=>{
@@ -2460,7 +2523,7 @@ function TestCreator({ existing, onSave, onCancel }) {
       {step===1&&(
         <div>
           <label style={S.label}>Test nomi</label>
-          <input value={name} onChange={e=>setName(e.target.value)} style={S.input} placeholder="Algebra imtihoni"/>
+          <input value={name} onChange={e=>setName(e.target.value)} style={S.input} placeholder="Test nomi"/>
 
           {/* PDF / LaTeX upload */}
           <label style={S.label}>📄 Test varianti (ixtiyoriy)</label>
@@ -2655,6 +2718,42 @@ function TestCreator({ existing, onSave, onCancel }) {
               <p style={{margin:"8px 0 0",fontSize:12,color:"#92400E"}}>
                 O'quvchi to'lov qilgach, ushbu kodni unga yuboring. Test ichiga kirishdan oldin shu kod so'raladi.
               </p>
+            )}
+          </div>
+
+          {/* Qaysi guruhlarga ko'rinishi */}
+          <div style={{background:"#EEF1FF",border:`1.5px solid ${C.border}`,borderRadius:12,padding:14,marginBottom:16}}>
+            <label style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",marginBottom:restrictGroups?12:0}}>
+              <input type="checkbox" checked={restrictGroups} onChange={e=>setRestrictGroups(e.target.checked)}
+                style={{width:20,height:20,accentColor:C.primary,cursor:"pointer"}}/>
+              <span style={{fontWeight:700,color:C.primary,fontSize:14}}>👥 Faqat tanlangan guruhlarga ko'rinsin</span>
+            </label>
+            {!restrictGroups && (
+              <p style={{margin:0,fontSize:12,color:C.textMid}}>Hozircha barcha guruhlarga ko'rinadi.</p>
+            )}
+            {restrictGroups && (
+              <div>
+                {allGroups.length>0 && (
+                  <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:10}}>
+                    {allGroups.map(g=>(
+                      <button key={g} onClick={()=>toggleGroup(g)} style={{
+                        padding:"6px 14px",borderRadius:20,border:`1.5px solid ${targetGroups.includes(g)?C.primary:C.border}`,
+                        background:targetGroups.includes(g)?C.primary:"white",color:targetGroups.includes(g)?"white":C.text,
+                        fontWeight:600,fontSize:13,cursor:"pointer"
+                      }}>{targetGroups.includes(g)?"✓ ":""}{g}</button>
+                    ))}
+                  </div>
+                )}
+                <div style={{display:"flex",gap:8}}>
+                  <input value={customGroupInput} onChange={e=>setCustomGroupInput(e.target.value)}
+                    onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addCustomGroup();}}}
+                    style={{...S.input,margin:0}} placeholder="Yangi guruh nomi (masalan 10-A)"/>
+                  <button onClick={addCustomGroup} style={{...S.btnSmall,background:C.primary,whiteSpace:"nowrap"}}>+ Qo'shish</button>
+                </div>
+                {targetGroups.length>0 && (
+                  <p style={{margin:"8px 0 0",fontSize:12,color:C.textMid}}>Tanlangan: <b>{targetGroups.join(", ")}</b></p>
+                )}
+              </div>
             )}
           </div>
 
@@ -2873,6 +2972,25 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
   const [adminDocPreview,setAdminDocPreview]=useState(null); // {type:"pdf"|"latex", url?, source?, name}
   const [confirmModal,setConfirmModal]=useState(null);
   const [exportModal,setExportModal]=useState(null); // {dataUrl, filename, tsv, isBinary}
+  const [regradingId,setRegradingId]=useState(null); // hozir qayta baholanayotgan test id
+  const [regradeDoneMsg,setRegradeDoneMsg]=useState(null);
+
+  const handleRegrade = (test) => {
+    setConfirmModal({
+      message: `"${test.name}" testi bo'yicha barcha topshirilgan javoblar joriy (yangilangan) to'g'ri javob kaliti bilan qayta tekshiriladi. Davom etilsinmi?`,
+      confirmLabel: "Qayta baholash",
+      danger: false,
+      onConfirm: async () => {
+        setConfirmModal(null);
+        setRegradingId(test.id);
+        const count = await regradeTestResults(test);
+        setRegradingId(null);
+        reload();
+        setRegradeDoneMsg(`✅ "${test.name}" — ${count} ta natija qayta baholandi.`);
+        setTimeout(()=>setRegradeDoneMsg(null), 4000);
+      },
+    });
+  };
 
   const reload=()=>{setTests(db.get("tests")||[]);setUsers(db.get("users")||[]);setResults(db.get("results")||[]);};
   useEffect(reload,[tab]);
@@ -2906,7 +3024,10 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
 
   return (
     <div style={S.page}>
-      {confirmModal && <ConfirmModal message={confirmModal.message} onConfirm={confirmModal.onConfirm} onCancel={()=>setConfirmModal(null)}/>}
+      {confirmModal && <ConfirmModal message={confirmModal.message} confirmLabel={confirmModal.confirmLabel} danger={confirmModal.danger} onConfirm={confirmModal.onConfirm} onCancel={()=>setConfirmModal(null)}/>}
+      {regradeDoneMsg && (
+        <div style={{position:"fixed",top:16,left:"50%",transform:"translateX(-50%)",zIndex:99999,background:C.successDark,color:"white",padding:"12px 20px",borderRadius:12,fontWeight:700,fontSize:13,boxShadow:"0 6px 20px rgba(0,0,0,0.2)",maxWidth:"90%",textAlign:"center"}}>{regradeDoneMsg}</div>
+      )}
       {exportModal && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.5)", zIndex: 99999, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={()=>setExportModal(null)}>
           <div style={{ background: "white", borderRadius: 16, padding: 22, maxWidth: 360, width: "100%", boxShadow: "0 10px 40px rgba(0,0,0,0.25)" }} onClick={e=>e.stopPropagation()}>
@@ -2970,11 +3091,13 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                         {test.pdfUrl&&<button onClick={()=>setAdminDocPreview({type:"pdf",url:test.pdfUrl,name:test.name})} style={{...S.badge,background:"#FEF3C7",color:"#92400E",border:"none",cursor:"pointer"}}>📄 PDF</button>}
                         {test.latexSource&&<button onClick={()=>setAdminDocPreview({type:"latex",source:test.latexSource,name:test.name,id:test.id,images:test.latexImages})} style={{...S.badge,background:"#EEF1FF",color:C.primary,border:"none",cursor:"pointer"}}>∑ LaTeX</button>}
                         {test.accessCode&&<span style={{...S.badge,background:"#FEF3C7",color:"#92400E"}}>🔒 Kod: {test.accessCode}{test.codePrice?` (${test.codePrice} so'm)`:""}</span>}
+                        {test.targetGroups&&test.targetGroups.length>0&&<span style={{...S.badge,background:C.primaryLight,color:C.primary}}>👥 {test.targetGroups.join(", ")}</span>}
                       </div>
                     </div>
                     <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
                       <button onClick={()=>toggleActive(test.id)} style={{...S.btnSmall,background:test.active?C.danger:C.success}}>{test.active?"⛔ To'xtatish":"✅ Faollashtirish"}</button>
                       <button onClick={()=>{setEditing(test);setCreating(false);}} style={{...S.btnSmall,background:C.primary}}>✏️ Tahrirlash</button>
+                      <button onClick={()=>handleRegrade(test)} disabled={regradingId===test.id} style={{...S.btnSmall,background:regradingId===test.id?"#94A3B8":"#7C3AED"}}>{regradingId===test.id?"⏳ Baholanmoqda...":"🔄 Qayta baholash"}</button>
                       <button onClick={()=>setExportModal(buildExcelExport(test,results,users))} style={{...S.btnSmall,background:C.successDark}}>📥 Excel</button>
                       <button onClick={()=>deleteTest(test.id)} style={{...S.btnSmall,background:C.danger}}>🗑️</button>
                     </div>
@@ -3087,6 +3210,8 @@ function StudentDashboard({ user, onLogout }) {
   const [codeModal,setCodeModal]=useState(null); // test waiting for code entry
   const [codeInput,setCodeInput]=useState("");
   const [codeErr,setCodeErr]=useState("");
+  // Test faqat tanlangan guruh(lar)ga mo'ljallangan bo'lsa, o'quvchi o'z guruhida bo'lsagina ko'rsin
+  const visibleForMe = (t) => !t.targetGroups || t.targetGroups.length===0 || t.targetGroups.includes(user.group);
   const [unlockedTests,setUnlockedTests]=useState(()=>{
     try { return JSON.parse(localStorage.getItem("unlockedTests_"+user.phone)||"[]"); } catch { return []; }
   });
@@ -3162,7 +3287,7 @@ function StudentDashboard({ user, onLogout }) {
               {codeModal.codePrice&&<p style={{margin:"6px 0 0",color:"#92400E",fontWeight:700,fontSize:16}}>{codeModal.codePrice} so'm</p>}
             </div>
             <p style={{color:C.textMid,fontSize:13,textAlign:"center",marginBottom:14}}>
-              Testga kirish uchun  sizga berilgan kodni kiriting.
+              Testga kirish uchun to'lov qiling va sizga berilgan kodni kiriting.
             </p>
             {codeErr&&<div style={S.err}>{codeErr}</div>}
             <input value={codeInput} onChange={e=>setCodeInput(e.target.value.toUpperCase())}
@@ -3189,10 +3314,10 @@ function StudentDashboard({ user, onLogout }) {
       <div style={{padding:20,maxWidth:800,margin:"0 auto"}}>
         {tab==="tests"&&(
           <div>
-            {tests.filter(t=>!t.active&&t.scheduledAt&&t.scheduledAt>now).length>0&&(
+            {tests.filter(t=>!t.active&&t.scheduledAt&&t.scheduledAt>now&&visibleForMe(t)).length>0&&(
               <div style={{marginBottom:24}}>
                 <h3 style={{marginBottom:16}}>🗓️ Rejalashtirilgan Testlar</h3>
-                {tests.filter(t=>!t.active&&t.scheduledAt&&t.scheduledAt>now).map(test=>(
+                {tests.filter(t=>!t.active&&t.scheduledAt&&t.scheduledAt>now&&visibleForMe(t)).map(test=>(
                   <div key={test.id} style={{...S.card,padding:18,marginBottom:12,border:`1.5px dashed ${C.primary}`}}>
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
                       <div>
@@ -3209,7 +3334,7 @@ function StudentDashboard({ user, onLogout }) {
               </div>
             )}
             <h3 style={{marginBottom:16}}>Faol Testlar</h3>
-            {tests.filter(t=>t.active).map(test=>{
+            {tests.filter(t=>t.active&&visibleForMe(t)).map(test=>{
               const myRes=results.find(r=>r.testId===test.id);
               let timeInfo=null, expired=false;
               if(test.startedAt){
@@ -3244,7 +3369,7 @@ function StudentDashboard({ user, onLogout }) {
                 </div>
               );
             })}
-            {tests.filter(t=>t.active).length===0&&<div style={S.empty}>Hozircha faol testlar yo'q</div>}
+            {tests.filter(t=>t.active&&visibleForMe(t)).length===0&&<div style={S.empty}>Hozircha faol testlar yo'q</div>}
           </div>
         )}
         {tab==="monitoring"&&(
@@ -3910,11 +4035,31 @@ function SplashScreen({ onDone }) {
 }
 
 export default function App() {
-  const [page,setPage]=useState("login");
-  const [user,setUser]=useState(null);
-  const [isAdmin,setIsAdmin]=useState(false);
-  const [isTeacher,setIsTeacher]=useState(false);
-  const [teacherInfo,setTeacherInfo]=useState(null);
+  // Saqlangan sessiya bo'lsa (avval login qilingan bo'lsa), avtomatik tiklaymiz —
+  // login/parol qayta so'ralmaydi. Foydalanuvchi ma'lumoti bazadan yangilanib olinadi
+  // (masalan boshqa qurilmada tahrirlangan bo'lishi mumkin).
+  const initFromSession = () => {
+    const s = loadSession();
+    if (!s) return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null };
+    if (s.role === "admin") return { page: "admin", user: null, isAdmin: true, isTeacher: false, teacherInfo: null };
+    if (s.role === "teacher") {
+      const t = (db.get("teachers")||[]).find(x => x.id === s.teacherId);
+      if (!t) { clearSession(); return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null }; }
+      return { page: "teacher", user: null, isAdmin: false, isTeacher: true, teacherInfo: t };
+    }
+    if (s.role === "student") {
+      const u = (db.get("users")||[]).find(x => x.phone === s.phone);
+      if (!u) { clearSession(); return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null }; }
+      return { page: "student", user: u, isAdmin: false, isTeacher: false, teacherInfo: null };
+    }
+    return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null };
+  };
+  const initState = initFromSession();
+  const [page,setPage]=useState(initState.page);
+  const [user,setUser]=useState(initState.user);
+  const [isAdmin,setIsAdmin]=useState(initState.isAdmin);
+  const [isTeacher,setIsTeacher]=useState(initState.isTeacher);
+  const [teacherInfo,setTeacherInfo]=useState(initState.teacherInfo);
   const [showSplash,setShowSplash]=useState(true);
   useEffect(()=>{
     initDB();
@@ -3941,16 +4086,16 @@ export default function App() {
   },[]);
 
   if(showSplash) return <SplashScreen onDone={()=>setShowSplash(false)}/>;
-  if(page==="admin"&&isAdmin) return <AdminPanel isFullAdmin={true} onLogout={()=>{setIsAdmin(false);setPage("login");}}/>;
-  if(page==="teacher"&&isTeacher) return <AdminPanel isFullAdmin={false} teacherInfo={teacherInfo} onLogout={()=>{setIsTeacher(false);setTeacherInfo(null);setPage("login");}}/>;
-  if(page==="student"&&user) return <StudentDashboard user={user} onLogout={()=>{setUser(null);setPage("login");}}/>;
-  if(page==="register") return <RegisterPage onDone={u=>{setUser(u);setPage("student");}} onLogin={()=>setPage("login")}/>;
+  if(page==="admin"&&isAdmin) return <AdminPanel isFullAdmin={true} onLogout={()=>{setIsAdmin(false);setPage("login");clearSession();}}/>;
+  if(page==="teacher"&&isTeacher) return <AdminPanel isFullAdmin={false} teacherInfo={teacherInfo} onLogout={()=>{setIsTeacher(false);setTeacherInfo(null);setPage("login");clearSession();}}/>;
+  if(page==="student"&&user) return <StudentDashboard user={user} onLogout={()=>{setUser(null);setPage("login");clearSession();}}/>;
+  if(page==="register") return <RegisterPage onDone={u=>{setUser(u);setPage("student");saveSession({role:"student",phone:u.phone});}} onLogin={()=>setPage("login")}/>;
   return <LoginPage
-    onLogin={u=>{setUser(u);setPage("student");}}
+    onLogin={u=>{setUser(u);setPage("student");saveSession({role:"student",phone:u.phone});}}
     onRegister={()=>setPage("register")}
     onAdmin={(fullAdmin, teacher)=>{
-      if(fullAdmin){ setIsAdmin(true); setPage("admin"); }
-      else { setIsTeacher(true); setTeacherInfo(teacher); setPage("teacher"); }
+      if(fullAdmin){ setIsAdmin(true); setPage("admin"); saveSession({role:"admin"}); }
+      else { setIsTeacher(true); setTeacherInfo(teacher); setPage("teacher"); saveSession({role:"teacher",teacherId:teacher.id}); }
     }}
   />;
 }
