@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
+aimport { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
 import * as XLSX from "xlsx";
 
 // ===== KaTeX CDN loader =====
@@ -572,7 +572,30 @@ function LatexDocViewerImpl({ source, images }) {
 // yangilanadigan holatlar LaTeX/KaTeX'ni qayta hisoblashga majburlamaydi
 const LatexDocViewer = memo(LatexDocViewerImpl, (prev, next) => prev.source === next.source && prev.images === next.images);
 
-function KatexSpan({ latex, block }) {
+// Test uchun mavjud tillardagi hujjatlarni (PDF/LaTeX) ko'rsatadigan tugmalar qatori.
+// Har bir til alohida tugma — bosilganda o'sha tildagi hujjat ochiladi.
+function DocLangButtons({ test, onOpen, small }) {
+  const langs = availableDocLangs(test);
+  if (langs.length === 0) return null;
+  return (
+    <>
+      {langs.map(l => {
+        const d = getLangDoc(test, l.code);
+        const isPdf = !!d.pdfUrl;
+        return (
+          <button key={l.code} onClick={() => onOpen(isPdf
+            ? { type:"pdf", url:d.pdfUrl, id:test.id+"_"+l.code, name:`${test.name} — ${l.full}` }
+            : { type:"latex", source:d.latexSource, id:test.id+"_"+l.code, images:d.latexImages, name:`${test.name} — ${l.full}` }
+          )} style={{...S.badge,background:isPdf?"#FEF3C7":C.primaryLight,color:isPdf?"#92400E":C.primary,border:"none",cursor:"pointer",fontSize:small?12:13,display:"inline-flex",alignItems:"center",gap:4}}>
+            <span><LangFlag lang={l}/></span><span>{isPdf?"📄":"∑"} {l.label}</span>
+          </button>
+        );
+      })}
+    </>
+  );
+}
+
+function KatexSpan({ latex, block, fontSize }) {
   const ref = useRef(null);
   const [ready, setReady] = useState(!!window.katex);
   useEffect(() => { if (!window.katex) loadKatex(() => setReady(true)); }, []);
@@ -583,32 +606,91 @@ function KatexSpan({ latex, block }) {
     } catch {}
   }, [latex, ready, block]);
   if (!latex) return null;
-  return <span ref={ref} style={{ fontFamily: "KaTeX_Main, serif", fontSize: block ? 20 : 16 }} />;
+  return <span ref={ref} style={{ fontFamily: "KaTeX_Main, serif", fontSize: fontSize || (block ? 20 : 16) }} />;
 }
 
 // Convert display string to LaTeX for render
 function toLatex(s) {
   if (!s) return "";
-  let r = s;
 
-  // Mixed number pattern: (N+FRAC(a,b)) → N\frac{a}{b}
-  let mfPrev = "", mfIter = 0;
-  while (mfPrev !== r && mfIter++ < 20) {
-    mfPrev = r;
-    r = r.replace(/\((-?\d+\.?\d*)\+FRAC\(([^()]+),([^()]+)\)\)/g, "$1\\frac{$2}{$3}");
-    r = r.replace(/\((-\d+\.?\d*)-FRAC\(([^()]+),([^()]+)\)\)/g, "$1\\frac{$2}{$3}");
+  // Qavslar ichma-ich bo'lganda ham to'g'ri ishlashi uchun (masalan FRAC(√(3/2),5))
+  // — mos yopiluvchi qavsni topamiz (chuqurlikni hisoblab)
+  function findMatchClose(str, openIdx) {
+    let depth = 0;
+    for (let i = openIdx; i < str.length; i++) {
+      if (str[i] === "(") depth++;
+      else if (str[i] === ")") { depth--; if (depth === 0) return i; }
+    }
+    return -1;
+  }
+  // Faqat ENG TASHQI (top-level) vergullar bo'yicha bo'lish — ichkaridagi vergullarga tegmaydi
+  function splitTopLevel(str) {
+    const parts = []; let depth = 0, last = 0;
+    for (let i = 0; i < str.length; i++) {
+      const c = str[i];
+      if (c === "(") depth++;
+      else if (c === ")") depth--;
+      else if (c === "," && depth === 0) { parts.push(str.slice(last, i)); last = i + 1; }
+    }
+    parts.push(str.slice(last));
+    return parts;
   }
 
-  // FRAC(a,b) -> \frac{a}{b}  (max 30 iterations safety)
-  let prev = "", prevIter = 0;
-  while (prev !== r && prevIter++ < 30) {
-    prev = r;
-    r = r.replace(/FRAC\(([^()]+),([^()]+)\)/g, "\\frac{$1}{$2}");
+  // FRAC/ROOT/ABS/LOG_BASE/SUB/√(...) larni rekursiv ravishda LaTeX'ga aylantiradi —
+  // ichidagi formulalar qanchalik chuqur ichma-ich bo'lishidan qat'iy nazar to'g'ri ishlaydi.
+  // Bo'sh joylar (masalan hali yozilmagan maxraj) uchun nozik "□" belgisi qo'yiladi —
+  // shunda foydalanuvchi qayerga yozish kerakligini ko'radi.
+  const ph = a => a || "\\square";
+  function convert(str) {
+    let out = "";
+    let i = 0;
+    while (i < str.length) {
+      // Aralash son: (N+FRAC(a,b)) yoki (N-FRAC(a,b)) → N\frac{a}{b}
+      const mixed = /^\((-?\d+\.?\d*)([+-])FRAC\(/.exec(str.slice(i));
+      if (mixed) {
+        const fracOpen = i + mixed[0].length - 1;
+        const fracClose = findMatchClose(str, fracOpen);
+        if (fracClose !== -1 && str[fracClose + 1] === ")") {
+          const args = splitTopLevel(str.slice(fracOpen + 1, fracClose)).map(convert);
+          if (args.length === 2) {
+            out += `${mixed[1]}${mixed[2] === "-" ? "-" : ""}\\frac{${ph(args[0])}}{${ph(args[1])}}`;
+            i = fracClose + 2;
+            continue;
+          }
+        }
+      }
+      const fn = /^(FRAC|ROOT|ABS|LOG_BASE|SUB|SUP)\(/.exec(str.slice(i));
+      if (fn) {
+        const openIdx = i + fn[0].length - 1;
+        const closeIdx = findMatchClose(str, openIdx);
+        if (closeIdx !== -1) {
+          const args = splitTopLevel(str.slice(openIdx + 1, closeIdx)).map(convert);
+          if (fn[1] === "FRAC" && args.length === 2) out += `\\frac{${ph(args[0])}}{${ph(args[1])}}`;
+          else if (fn[1] === "ROOT" && args.length === 2) out += `\\sqrt[${ph(args[0])}]{${ph(args[1])}}`;
+          else if (fn[1] === "ABS" && args.length === 1) out += `\\left|${ph(args[0])}\\right|`;
+          else if (fn[1] === "LOG_BASE" && args.length === 2) out += `\\log_{${ph(args[0])}}(${ph(args[1])})`;
+          else if (fn[1] === "SUB" && args.length === 2) out += `${ph(args[0])}_{${ph(args[1])}}`;
+          else if (fn[1] === "SUP" && args.length === 2) out += `{${ph(args[0])}}^{${ph(args[1])}}`;
+          else out += str.slice(i, closeIdx + 1);
+          i = closeIdx + 1;
+          continue;
+        }
+      }
+      if (str[i] === "√" && str[i + 1] === "(") {
+        const closeIdx = findMatchClose(str, i + 1);
+        if (closeIdx !== -1) {
+          out += `\\sqrt{${ph(convert(str.slice(i + 2, closeIdx)))}}`;
+          i = closeIdx + 1;
+          continue;
+        }
+      }
+      out += str[i];
+      i++;
+    }
+    return out;
   }
-  r = r.replace(/SUB\(([^,]+),([^)]+)\)/g, "$1_{$2}");
-  r = r.replace(/ROOT\(([^,]+),([^)]+)\)/g, "\\sqrt[$1]{$2}");
-  r = r.replace(/ABS\(([^)]+)\)/g, "\\left|$1\\right|");
-  r = r.replace(/√\(([^)]+)\)/g, "\\sqrt{$1}");
+
+  let r = convert(s);
   r = r.replace(/√(\d+\.?\d*)/g, "\\sqrt{$1}");
   r = r.replace(/\^(-?\d+\.?\d*)/g, "^{$1}");
   const syms = {
@@ -619,8 +701,6 @@ function toLatex(s) {
     "∂":"\\partial","∑":"\\sum","∫":"\\int"
   };
   Object.entries(syms).forEach(([k,v]) => { r = r.split(k).join(v); });
-  // LOG_BASE(base,arg) → \log_{base}(arg)
-  r = r.replace(/LOG_BASE\(([^,]+),([^)]+)\)/g, "\\log_{$1}($2)");
   r = r.replace(/(?<![\\a-zA-Z])\*/g, "\\cdot ");
   r = r.replace(/log_\(/g, "\\log_{");
   ["sin","cos","tan","cot","arcsin","arccos","arctan","sinh","cosh","tanh","lim","ln","lg"].forEach(fn => {
@@ -655,33 +735,33 @@ function MathInputField({ value, onFocus, style, placeholder, active }) {
 
   return (
     <div
-      onClick={onFocus}
+      onClick={e => { onFocus?.(); setTimeout(()=>e.currentTarget.scrollIntoView({behavior:"smooth",block:"center"}),350); }}
       style={{
-        minHeight: 48, padding: "10px 16px",
-        background: active ? "#F8FAFF" : "#FFFFFF",
+        minHeight: 54, padding: "12px 18px",
+        background: active ? "#F5F7FF" : "#FFFFFF",
         border: `2px solid ${active ? "#6366F1" : value ? "#22C55E" : "#E2E8F0"}`,
-        borderRadius: 12, cursor: "pointer",
+        borderRadius: 14, cursor: "pointer",
         display: "flex", alignItems: "center", flexWrap: "wrap",
-        boxShadow: active ? "0 0 0 3px rgba(99,102,241,0.12)" : "none",
-        transition: "all 0.2s",
+        boxShadow: active ? "0 0 0 4px rgba(99,102,241,0.14), 0 2px 10px rgba(99,102,241,0.12)" : value ? "0 1px 4px rgba(34,197,94,0.08)" : "none",
+        transition: "all 0.2s ease",
         ...style,
       }}
     >
       {value ? (
-        <span ref={ref} style={{ fontSize: 20, fontFamily: "KaTeX_Main,serif", color: active ? "#4F46E5" : "#15803D" }} />
+        <span ref={ref} style={{ fontSize: 23, fontFamily: "KaTeX_Main,serif", color: active ? "#4338CA" : "#15803D" }} />
       ) : (
-        <span style={{ color: "#94A3B8", fontSize: 14 }}>{placeholder || "Javob yozish uchun bosing..."}</span>
+        <span style={{ color: "#94A3B8", fontSize: 15 }}>{placeholder || "Javob yozish uchun bosing..."}</span>
       )}
       {active && !value && (
-        <span style={{ display:"inline-block", width:2, height:22, background:"#6366F1", borderRadius:1, marginLeft:2, animation:"blink 1s step-end infinite" }} />
+        <span style={{ display:"inline-block", width:2, height:24, background:"#6366F1", borderRadius:1, marginLeft:2, animation:"blink 1s step-end infinite" }} />
       )}
     </div>
   );
 }
 
 // ===== STORAGE =====
-const ADMIN_LOGIN = "admin";
-const ADMIN_PW = "admin123";
+const ADMIN_LOGIN = "Dilshod_11";
+const ADMIN_PW = "Dilshod_11";
 
 // ===== 🔧 FIREBASE SOZLASH =====
 // console.firebase.google.com da loyiha yarating → Project settings → Your apps → Web (</>)
@@ -738,18 +818,30 @@ function initFirebaseSync() {
   });
 }
 
-// Butun kolleksiyani Firestore'ga yozadi (id bo'yicha upsert + o'chirilganlarni tozalash).
-async function pushCollectionToFirestore(col, arr) {
+// Butun kolleksiyani har safar Firestore'dan o'qib-qayta yozish (eskirgan yondashuv)
+// 1000+ foydalanuvchi bir vaqtda ishlaganda juda sekin va qimmat bo'lardi (har bir kichik
+// yozuvda BUTUN to'plam o'qilib-qayta yozilardi). Endi faqat O'ZGARGAN yozuvlarni
+// yuboramiz — Firestore'dan o'qishga UMUMAN ehtiyoj yo'q, chunki eski holat allaqachon
+// bizning qo'limizda (localStorage'da).
+async function pushCollectionDiffToFirestore(col, prevArr, nextArr) {
   if (!fbFirestore) return;
   try {
     const coll = fbFirestore.collection(col);
-    const snap = await coll.get();
-    const existingIds = new Set(snap.docs.map(d => d.id));
-    const newIds = new Set(arr.map(item => String(item.id)));
+    const prevMap = new Map((prevArr || []).map(i => [String(i.id), i]));
+    const nextMap = new Map((nextArr || []).map(i => [String(i.id), i]));
     const batch = fbFirestore.batch();
-    arr.forEach(item => { batch.set(coll.doc(String(item.id)), item); });
-    existingIds.forEach(id => { if (!newIds.has(id)) batch.delete(coll.doc(id)); });
-    await batch.commit();
+    let ops = 0;
+    for (const [id, item] of nextMap) {
+      const old = prevMap.get(id);
+      if (!old || JSON.stringify(old) !== JSON.stringify(item)) {
+        batch.set(coll.doc(id), item);
+        ops++;
+      }
+    }
+    for (const id of prevMap.keys()) {
+      if (!nextMap.has(id)) { batch.delete(coll.doc(id)); ops++; }
+    }
+    if (ops > 0) await batch.commit();
   } catch (e) { console.error("[Firebase] Yozishda xato:", col, e); }
 }
 
@@ -757,9 +849,13 @@ const db = {
   get: (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
   set: (k, v) => {
     try {
-      localStorage.setItem(k, JSON.stringify(v));
+      let prevForDiff = null;
       if (fbFirestore && FIREBASE_SYNC_COLLECTIONS.includes(k) && Array.isArray(v)) {
-        pushCollectionToFirestore(k, v);
+        prevForDiff = db.get(k); // eski holatni yozishdan OLDIN olib qolamiz (diff uchun)
+      }
+      localStorage.setItem(k, JSON.stringify(v));
+      if (prevForDiff !== null || (fbFirestore && FIREBASE_SYNC_COLLECTIONS.includes(k) && Array.isArray(v))) {
+        pushCollectionDiffToFirestore(k, prevForDiff, v);
       }
       return true;
     } catch (err) {
@@ -775,6 +871,16 @@ function initDB() {
   ["users","tests","results"].forEach(k => { if (!db.get(k)) db.set(k, []); });
   autoActivateScheduledTests();
 }
+
+// ===== SESSIYANI ESLAB QOLISH =====
+// Login/parolni har safar qayta so'ramaslik uchun — bir marta kirgan
+// foydalanuvchi (o'quvchi/admin/o'qituvchi) qurilmada eslab qolinadi.
+// Telegram Mini App har ochilishida sahifa "yangi holatda" boshlangani
+// uchun bu ayniqsa muhim (aks holda har safar qaytadan login so'raladi).
+const SESSION_KEY = "app_session_v1";
+function saveSession(s) { try { localStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch {} }
+function loadSession() { try { return JSON.parse(localStorage.getItem(SESSION_KEY)); } catch { return null; } }
+function clearSession() { try { localStorage.removeItem(SESSION_KEY); } catch {} }
 
 // ===== SCHEDULED TEST AUTO-ACTIVATION =====
 // Har bir testda ixtiyoriy `scheduledAt` (ms timestamp) bo'lishi mumkin — admin
@@ -809,6 +915,44 @@ function localInputToTs(s) {
 function formatScheduled(ts) {
   if (!ts) return "";
   return new Date(ts).toLocaleString("uz-UZ", { day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" });
+}
+const UZ_FLAG_IMG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAHgAAABQCAIAAABd+SbeAAAFkUlEQVR42u3cS2yUVRQH8P+595uvM9OZPqYDLX1AQd7YaEADrUURFUKMuKAJxAcxxBhl49aNa12YGDVK0ISEqEsTXfiIQoIxRRJJQwoItPKo2BZqh3amncf3usfFlEKglGJwFs75Lybt7ZeZ5NfTc8/c+VLC/m8h+e+jhKA0seZ4HQGKiOjGimEYZhG8n9CKyDAHrg9jppaYYWkK6eKXkvsArRUFjgdLdzTVdTQkFscjAbg/nesevtYzMl68Yvr3wWAwiIiZrz8CuPEtio8CfasyUZB3O1vmvde+en19zfT6hOcPZHI/Xxn7sPfCH5kcEzFgPB9EIGI2ILBhKGIGmKEUmwDF1qOVQN9WywXvtYeW7NvYpgiGAfCnZy5/9vvA6bFJz5iF8WhlyNKKfIbFvHvNorZE1TvH+xrikTfbWr/sHzo5Mv7Wo8uHc86Bk5eebm3c3FT3/okLfeksNJVbWavZatnxnmqt3/94G4Ndw64xXT/2vHGop2dk3DHGEF1KZ0+Ppj2GIjJe0F5fu2dFs2NMMmzvXtbcEK3Iu96uJQs2LUjks4VVtbE9K5qNIjBT+VU0zThHEwBGVKtTO59ojUc8Y0JKvXKk9+CJ83Y84htmZgYIIIJhFOHqwnZIqeFcIaJVbdhOO17W8Rqror4xIxP5mmg4bltD2UIQBFBKWsdU0/Dz7vY1i1rjEdcYW6lfr44dPD1gxcJuYKYv4+sjR7ENjOYcGE7Gwk5ghtJZuyLUWBUdyuRAaKqODWbz47lCojJsYGUKHhNYWgczQLS1OckotmZ83j9Exsz+RJrwQFXkl+0bvnpmbVLrDzpW9+7oXFpd+diCupNdnXtXL6wLWd3Pt3+zZV1dSFOZNZCZK9qAodXy6koCLCIAvakMKzXLDmYAIhrIFn4aTA1nC6MF5+iVsRrbGi64HnBocPRcOjvueocHU1fzTsrxYKmy2g/v0KMJ7JtjOzrXz6/xDVuK2r8+emwwpW0rmJVHEwWeD0XQGq4HP0CkAszIu6gIwVLIuyBCRUjOOoqrhMBcnMgx4DMDWFkTIzZ0t7/2gFmFLFIqxLxpYf3r65YlLN0Qrdj7yPJVyapKxktti7tWtcSVoutbaFlDEwHMhwdThCmOXUsXMGguNIZZEbEfvLy8aV/ng1Hbao1HP+5cs6U5SYH5qGP122uXqal3jNI6ABiuDYfO7dqUqLANs6Vo2/e//dA3aMfCnpk6TSLcGDlu7zxLE/GWynD3lbGIpdYlq/szucvp7Lr62qwfnE1lSKuymjo0nntx5h9olcs5f+W9riUNPjMDz7bMOzIy/udoGkqRIlU8tTAMRTN262s559LYZKDI8c3FscmM58ctvXXR/JZYuO/apF9mPfqO0MzQltV7ZUxbanNjUhFFtN65rBFaX8jkJgou+0EsbDfGo5OeP+PcpxQprRkggrY0EUJEB558eHE88sXZywERS+u45Y34rpUt725YuSgWmV7vT2evZgtn0tlPTl3qTU2wmpOaRTQvYgfMf+fdcjvBo7t+lKWJAsetrgxva5m/sTHRGosS4Xwmd2Qo9d3ASN71YOl7eEFjAJq525Q59JS1MfB8MKAUwAgMiGBbSql7+pylOGyU4Ym0NZfzyuLEpipChKkjJLKJwQEzG3NvxXnTuFJe0Kz1HH3MzTUJBqgcwf41dLVTEIVS9OjD0VZRKEVFr3z1BVEoRUWz3C1Qos3QD0RBKvr/E7n3TqAFWiLQAi3QQiDQAi0RaIEWaIlAC7REoAVaoCUCLdASgRbo8o4l/5ygVNAkN9CVIjTQ2SUKpajo7tRxUShFRTce2igKpajoUEFuCSsJNMteKHO0QEsEWqAFWiLQAi0RaIEWaIlAC7REoAVaoCUCLdASgRZogZYItEBLBFqgyzj/ABi4aLDcDtFaAAAAAElFTkSuQmCC";
+const RU_FLAG_IMG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAHgAAABQCAIAAABd+SbeAAAAzElEQVR42u3asRFBURCG0bveGwGBSBNmtKoEM2I9KIYCZCLXVYPAH3C+Es7szG6wNcZo+n4LBKBBCzRo0AINWqBBgxZo0AINGrRAgxZo0KAFGrQ+a352fx2JygNNaKLPlyuFxES3/YlCYqKnzZJCArpbhs470AINGrRAgxZo0KAFGrRAgwYt0KAFGjRogf6V5qm9KCSge60oJKAPjyOFQHXbbSkkJvpeawqWofNOoEGDFmjQAg0atECDFmjQoAUatECDBi3QoAUa9N/2BrvhFxQCa2t4AAAAAElFTkSuQmCC";
+const QQ_FLAG_IMG = "data:image/png;base64,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";
+
+// ===== Ko'p tillilik: test hujjatlari (PDF/LaTeX) 3 tilda: O'zbek, Qoraqalpoq, Rus =====
+const DOC_LANGS = [
+  { code:"uz", label:"UZ", full:"O'zbekcha", flag:null, flagImg:UZ_FLAG_IMG },
+  { code:"qq", label:"QQ", full:"Qoraqalpoqcha", flag:null, flagImg:QQ_FLAG_IMG },
+  { code:"ru", label:"РУ", full:"Русский", flag:null, flagImg:RU_FLAG_IMG },
+];
+// Til bayrog'ini chiqaradi: emoji mavjud bo'lsa emoji, aks holda (masalan Qoraqalpog'iston
+// uchun) yuklangan rasm ishlatiladi (chunki 🇶🇶 unicode emoji sifatida mavjud emas).
+function LangFlag({ lang, size }) {
+  const s = size || 16;
+  if (lang.flagImg) return <img src={lang.flagImg} alt={lang.label} style={{width:s*1.4,height:s,objectFit:"cover",borderRadius:3,verticalAlign:"middle",border:"1px solid rgba(0,0,0,0.08)"}}/>;
+  return <span style={{fontSize:s}}>{lang.flag}</span>;
+}
+function emptyLangDoc() { return { docType:"pdf", pdfUrl:null, latexSource:"", latexFileName:"", latexImages:{} }; }
+function emptyLangDocs() { return { uz: emptyLangDoc(), qq: emptyLangDoc(), ru: emptyLangDoc() }; }
+// Testning berilgan tildagi hujjatini qaytaradi (mavjud bo'lsa). Eski (bir tilli) testlar uchun
+// pdfUrl/latexSource maydonlari "uz" sifatida talqin qilinadi (orqaga moslik uchun).
+function getLangDoc(test, lang) {
+  if (!test) return null;
+  const d = test.langDocs && test.langDocs[lang];
+  if (d && (d.pdfUrl || d.latexSource)) return d;
+  if (lang === "uz" && !test.langDocs && (test.pdfUrl || test.latexSource)) {
+    return { docType: test.pdfUrl ? "pdf" : "latex", pdfUrl: test.pdfUrl||null, latexSource: test.latexSource||"", latexFileName: test.latexFileName||"", latexImages: test.latexImages||{} };
+  }
+  return null;
+}
+function testHasAnyDoc(test) {
+  if (!test) return false;
+  if (test.langDocs) return DOC_LANGS.some(l => { const d = getLangDoc(test, l.code); return d && (d.pdfUrl || d.latexSource); });
+  return !!(test.pdfUrl || test.latexSource);
+}
+function availableDocLangs(test) {
+  return DOC_LANGS.filter(l => { const d = getLangDoc(test, l.code); return d && (d.pdfUrl || d.latexSource); });
 }
 function formatCountdown(ms) {
   if (ms <= 0) return "Boshlanmoqda...";
@@ -880,6 +1024,10 @@ function processExpr(s) {
   let safety = 0;
   while (i < s.length && safety++ < 200000) {
     // FRAC(num,den) → (num)/(den)
+    // MUHIM: agar FRAC'dan oldin to'g'ridan-to'g'ri raqam kelsa (masalan "3" dan keyin
+    // darhol kasr, ular orasida ko'paytirish belgisisiz) — bu ARALASH SON deb hisoblanadi
+    // (3 va 4/5 = 3.8), ko'paytirish emas (3×4/5 = 2.4). Agar oldin ")" (hisoblangan
+    // ifoda) bo'lsa, bu haligacha ko'paytirish hisoblanadi.
     if (s.startsWith("FRAC(", i)) {
       const op = i + 4, cl = matchParen(s, op);
       if (cl !== -1) {
@@ -888,8 +1036,21 @@ function processExpr(s) {
         const num = cm >= 0 ? inner.slice(0, cm) : inner;
         const den = cm >= 0 ? inner.slice(cm + 1) : "1";
         const lastCh0 = result.slice(-1);
-        if (lastCh0 && /[\d)]/.test(lastCh0)) result += "*";
+        if (lastCh0 && /\d/.test(lastCh0)) result += "+";
+        else if (lastCh0 === ")") result += "*";
         result += "(" + processExpr(num) + ")/(" + processExpr(den) + ")";
+        i = cl + 1; continue;
+      }
+    }
+    // SUP(base,exp) → (base)^(exp) — daraja (masalan x²)
+    if (s.startsWith("SUP(", i)) {
+      const op = i + 3, cl = matchParen(s, op);
+      if (cl !== -1) {
+        const inner = s.slice(op + 1, cl);
+        const cm = topLevelComma(inner);
+        const base = cm >= 0 ? inner.slice(0, cm) : inner;
+        const exp  = cm >= 0 ? inner.slice(cm + 1) : "";
+        result += "(" + (processExpr(base) || "0") + ")^(" + (processExpr(exp) || "1") + ")";
         i = cl + 1; continue;
       }
     }
@@ -1361,11 +1522,322 @@ async function checkMathAsync(correct, student) {
 // Also used for real-time display in calculator
 function normForMathJs(s) { return toMathJs(s); }
 
+// ===== QAYTA BAHOLASH =====
+// Test topshirilganda javoblar (o'quvchining tanlagan/yozgan xom javoblari) doim
+// saqlanadi. Admin keyinroq to'g'ri javob kalitini tuzatsa, shu xom javoblarni
+// YANGI kalit bilan qayta solishtirib, natijalarni to'g'rilash mumkin.
+async function regradeTestResults(test) {
+  const all = db.get("results") || [];
+  let changed = 0;
+  const updated = [];
+  for (const r of all) {
+    if (r.testId !== test.id) { updated.push(r); continue; }
+    const scores = {}, subScores = {};
+    let total = 0;
+    for (let idx = 0; idx < test.questions.length; idx++) {
+      const q = test.questions[idx];
+      if (q.type === "closed") {
+        const ok = r.answers?.[idx] !== undefined && r.answers[idx] === q.correctAnswer;
+        scores[idx] = ok; if (ok) total++;
+      } else if (q.subParts?.length > 0) {
+        subScores[idx] = {};
+        for (let si = 0; si < q.subParts.length; si++) {
+          const sp = q.subParts[si];
+          const ok = await checkMathAsync(sp.answer, r.subAnswers?.[idx]?.[si] || "");
+          subScores[idx][si] = ok; if (ok) total++;
+        }
+      } else {
+        const ok = await checkMathAsync(q.correctAnswer, r.openAnswers?.[idx] || "");
+        scores[idx] = ok; if (ok) total++;
+      }
+    }
+    changed++;
+    updated.push({ ...r, scores, subScores, totalScore: total });
+  }
+  db.set("results", updated);
+  return changed;
+}
+
+// ===== RASH (RASCH) MODELI =====
+// Yuklangan "Rash_model_shablon.xlsx" jadvalidagi formulalarga aynan mos:
+// theta (qobiliyat logiti) -> Z-ball (sinf o'rtachasiga nisbatan) -> BALL (markaz atrofida,
+// lekin maksimal balldan hech qachon oshmaydigan asimptotik tanh formula) -> Daraja (harf baho).
+const DEFAULT_RASCH_SETTINGS = {
+  maxScore: 90.1,   // Maksimal ball (chegara)
+  center: 50,       // Markaz (o'rtacha) ball
+  ncMax: 45,        // NC chegarasi (bundan past)
+  cMax: 50,         // C chegarasi
+  cPlusMax: 55,     // C+ chegarasi
+  bMax: 60,         // B chegarasi
+  bPlusMax: 65,     // B+ chegarasi
+  aMax: 70,         // A chegarasi (bundan yuqori = A+)
+};
+// Testdagi umumiy baholanadigan "punkt"lar soni (har bir sub-qism alohida punkt hisoblanadi —
+// bu result.totalScore hisoblangan usul bilan bir xil bo'lishi kerak).
+function testTotalItems(test) {
+  let n = 0;
+  for (const q of test.questions || []) n += q.subParts?.length > 0 ? q.subParts.length : 1;
+  return n;
+}
+// Rash modeli logit (qobiliyat) qiymati: to'g'ri javoblar sonini 0.5..total-0.5 oralig'ida
+// "clamp" qilib (0% yoki 100% cheksizlikka aylanib qolmasligi uchun), logit-ga aylantiradi.
+function raschTheta(correct, total) {
+  if (!total || total <= 0) return null;
+  const c = Math.min(Math.max(correct, 0.5), total - 0.5);
+  return Math.log(c / (total - c));
+}
+function raschGrade(ball, s) {
+  if (ball < s.ncMax) return "NC";
+  if (ball < s.cMax) return "C";
+  if (ball < s.cPlusMax) return "C+";
+  if (ball < s.bMax) return "B";
+  if (ball < s.bPlusMax) return "B+";
+  if (ball < s.aMax) return "A";
+  return "A+";
+}
+// Bitta testning barcha topshirilgan natijalari uchun Rash modelini hisoblab, natijalarga
+// "rasch" maydonini qo'shib db'ga saqlaydi. O'quvchi bu natijani keyinroq o'z profilida ko'radi.
+function computeRaschForTest(test, settings = DEFAULT_RASCH_SETTINGS) {
+  const all = db.get("results") || [];
+  const total = testTotalItems(test);
+  const idxList = [], thetas = [];
+  all.forEach((r, i) => {
+    if (r.testId !== test.id) return;
+    const th = raschTheta(r.totalScore || 0, total);
+    if (th === null || !isFinite(th)) return;
+    idxList.push(i); thetas.push(th);
+  });
+  if (thetas.length === 0) return { count: 0 };
+  const mean = thetas.reduce((a, b) => a + b, 0) / thetas.length;
+  const variance = thetas.reduce((a, b) => a + (b - mean) ** 2, 0) / thetas.length; // STDEVP (populyatsiya)
+  const std = Math.sqrt(variance);
+  const range = settings.maxScore - settings.center;
+  const updated = [...all];
+  const calculatedAt = Date.now();
+  idxList.forEach((i, k) => {
+    const theta = thetas[k];
+    const z = std !== 0 ? (theta - mean) / std : 0;
+    const ball = range !== 0 ? settings.center + range * Math.tanh(10 * z / range) : settings.center;
+    const daraja = raschGrade(ball, settings);
+    updated[i] = { ...updated[i], rasch: { correct: updated[i].totalScore || 0, total, theta, zBall: z, ball, daraja, calculatedAt, settings } };
+  });
+  db.set("results", updated);
+  return { count: thetas.length, mean, std, calculatedAt };
+}
+
+// ===== RASH NATIJALARINI EXCEL FAYLDAN YUKLASH (import) =====
+// Admin/o'qituvchi natijalarni (masalan "Rash_model_shablon.xlsx" ga o'xshash, yoki o'zimiz
+// eksport qilgan faylga BALL/Daraja ustunlari qo'shilgan holini) tashqarida to'ldirib qaytadan
+// saytga yuklashi mumkin. Ustun nomlarini moslashuvchan (regex) tarzda topamiz, chunki fayl
+// shablon nomlaridan biroz farq qilishi mumkin.
+function parseUploadedResultsSheet(workbook) {
+  const sheetName = workbook.SheetNames.includes("Natijalar") ? "Natijalar" : workbook.SheetNames[0];
+  const ws = workbook.Sheets[sheetName];
+  if (!ws) return { rows: [] };
+  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "" });
+  let headerRowIdx = -1, cols = null;
+  for (let r = 0; r < Math.min(10, aoa.length); r++) {
+    const row = (aoa[r] || []).map(c => String(c ?? "").trim());
+    const nameIdx = row.findIndex(c => /ism|f\.?\s*i\.?\s*o|f\.?\s*i\.?\s*sh/i.test(c));
+    if (nameIdx >= 0) {
+      headerRowIdx = r;
+      cols = {
+        name: nameIdx,
+        group: row.findIndex(c => /guruh/i.test(c)),
+        ball: row.findIndex(c => /^ball$/i.test(c) || /^jami\s*ball$/i.test(c)),
+        daraja: row.findIndex(c => /daraja/i.test(c)),
+        theta: row.findIndex(c => /theta/i.test(c)),
+        zball: row.findIndex(c => /z[\s-]?ball/i.test(c)),
+        correct: row.findIndex(c => /^to.?g.?ri$/i.test(c)),
+        total: row.findIndex(c => /jami\s*savol/i.test(c)),
+        sCols: [],
+      };
+      row.forEach((c, ci) => { if (/^savol\s*\d+/i.test(c) || /^\d+(\.0)?$/.test(c)) cols.sCols.push(ci); });
+      break;
+    }
+  }
+  if (headerRowIdx === -1) return { rows: [] };
+  const rows = [];
+  for (let r = headerRowIdx + 1; r < aoa.length; r++) {
+    const row = aoa[r] || [];
+    const name = String(row[cols.name] ?? "").trim();
+    if (!name) continue;
+    const rec = { name, group: cols.group >= 0 ? String(row[cols.group] ?? "").trim() : "" };
+    const numOrNull = (v) => (v === "" || v === null || v === undefined || isNaN(Number(v))) ? null : Number(v);
+    if (cols.ball >= 0) { const v = numOrNull(row[cols.ball]); if (v !== null) rec.ball = v; }
+    if (cols.daraja >= 0 && row[cols.daraja]) rec.daraja = String(row[cols.daraja]).trim();
+    if (cols.theta >= 0) { const v = numOrNull(row[cols.theta]); if (v !== null) rec.theta = v; }
+    if (cols.zball >= 0) { const v = numOrNull(row[cols.zball]); if (v !== null) rec.zBall = v; }
+    if (cols.correct >= 0) { const v = numOrNull(row[cols.correct]); if (v !== null) rec.correct = v; }
+    if (cols.total >= 0) { const v = numOrNull(row[cols.total]); if (v !== null) rec.total = v; }
+    if (cols.sCols.length) {
+      let c = 0, t = 0;
+      cols.sCols.forEach(ci => { const v = row[ci]; if (v === 0 || v === 1 || v === "0" || v === "1") { t++; if (Number(v) === 1) c++; } });
+      if (t > 0) { if (rec.correct === undefined) rec.correct = c; if (rec.total === undefined) rec.total = t; }
+    }
+    rows.push(rec);
+  }
+  return { rows };
+}
+// Ismi bo'yicha "users" ro'yxati bilan solishtirib, tegishli natijaga rasch ma'lumotini yozadi.
+// Fayl BALL ustunini o'z ichiga olsa — o'sha qiymatlar TO'G'RIDAN-TO'G'RI ishlatiladi.
+// Aks holda (faqat To'g'ri/Jami savol yoki S1..S55 ustunlari bo'lsa) — Rash formulasi
+// aynan shu fayldagi o'quvchilar populyatsiyasi asosida (Excel'dagidek) hisoblanadi.
+// Fayldagi qatorlar uchun Rash modelini SOF hisoblaydi — hech qanday saytdagi
+// ro'yxatdan o'tgan foydalanuvchi yoki testga bog'liq emas. Agar faylda tayyor BALL ustuni
+// bo'lsa o'shani ishlatadi, aks holda To'g'ri/Jami (yoki S1..Sn) ustunlaridan Rash formulasi
+// bilan (shu faylning o'z populyatsiyasi asosida) hisoblab chiqadi.
+function computeRaschFromFileRows(rows, settings = DEFAULT_RASCH_SETTINGS) {
+  const hasDirectBall = rows.some(r => typeof r.ball === "number");
+  if (hasDirectBall) {
+    return rows.filter(r => typeof r.ball === "number" && isFinite(r.ball)).map(r => ({ ...r, daraja: r.daraja || raschGrade(r.ball, settings) }));
+  }
+  const withCorrect = rows.filter(r => typeof r.correct === "number" && typeof r.total === "number" && r.total > 0);
+  const thetas = withCorrect.map(r => raschTheta(r.correct, r.total));
+  const mean = thetas.length ? thetas.reduce((a, b) => a + b, 0) / thetas.length : 0;
+  const variance = thetas.length ? thetas.reduce((a, b) => a + (b - mean) ** 2, 0) / thetas.length : 0;
+  const std = Math.sqrt(variance);
+  const range = settings.maxScore - settings.center;
+  return withCorrect.map((r, i) => {
+    const theta = thetas[i];
+    const z = std !== 0 ? (theta - mean) / std : 0;
+    const ball = range !== 0 ? settings.center + range * Math.tanh(10 * z / range) : settings.center;
+    return { ...r, theta, zBall: z, ball, daraja: raschGrade(ball, settings) };
+  });
+}
+// Bitta testni saytda topshirganlar (results) VA yuklangan Excel fayldagi qatorlarni BITTA
+// umumiy Rash populyatsiyasi sifatida birlashtirib hisoblaydi (o'rtacha/standart chetlanish
+// ikkalasi bo'yicha ham hisoblanadi — ayri-ayri emas). Fayldagi ism saytdagi biror
+// ro'yxatdan o'tgan o'quvchiga mos kelsa, o'sha bitta yozuv sifatida qo'shiladi (ikki marta
+// hisoblanmaydi) va uning profiliga yoziladi. Saytdagi mos kelmagan (faylda yo'q) natijalar ham
+// hisoblashga kiradi. Faylda bor-u, saytda profili topilmagan o'quvchilar esa hisobga kiradi,
+// lekin natija hech kimning profiliga yozilmaydi — alohida ro'yxat (fileOnly) qilib qaytariladi.
+function importRaschFromRows(test, rows, settings = DEFAULT_RASCH_SETTINGS) {
+  const all = db.get("results") || [];
+  const users = db.get("users") || [];
+  // Fayldagi ism ustuniga ko'pincha qo'shimcha narsalar yopishtirilgan bo'ladi:
+  // "Safarov Abbos (A. Sultanov)", "Omonboyeva Charos Math@32", "Baxshulloev Usmonbek  " kabi.
+  // Shuning uchun avval qavs ichidagi va harf bo'lmagan belgilarni tozalaymiz,
+  // so'ng FAQAT ismning birinchi ikkita so'ziga (F.I.Sh) qarab moslashtiramiz.
+  const clean = (s) => (s || "")
+    .replace(/\([^)]*\)/g, " ")        // (guruh/o'qituvchi nomi) — olib tashlanadi
+    .replace(/[^\p{L}\s'’-]/gu, " ")   // raqam, @ va boshqa belgilar — olib tashlanadi
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  const nameToPhone = {};
+  users.forEach(u => {
+    nameToPhone[clean(`${u.firstName} ${u.lastName}`)] = u.phone;
+    nameToPhone[clean(`${u.lastName} ${u.firstName}`)] = u.phone;
+  });
+  const findPhone = (rawName) => {
+    const full = clean(rawName);
+    if (nameToPhone[full]) return nameToPhone[full];
+    const words = full.split(" ").filter(Boolean);
+    if (words.length >= 2) {
+      const a = words[0] + " " + words[1], b = words[1] + " " + words[0];
+      if (nameToPhone[a]) return nameToPhone[a];
+      if (nameToPhone[b]) return nameToPhone[b];
+    }
+    return null;
+  };
+
+  const total = testTotalItems(test);
+  const combined = [];      // {name, correct, total, theta, siteIdx, directBall, directDaraja}
+  const siteIdxUsed = new Set();
+  const unusable = [];      // fayldan kelgan, hisoblab bo'lmaydigan (na ball, na to'g'ri/jami) qatorlar
+
+  // 1) Fayldagi har bir qator — imkon bo'lsa saytdagi mos natijaga bog'lanadi
+  rows.forEach(rec => {
+    const correct = rec.correct, tot = rec.total;
+    const hasRaw = typeof correct === "number" && typeof tot === "number" && tot > 0;
+    if (!hasRaw && typeof rec.ball !== "number") { unusable.push(rec.name); return; }
+    const phone = findPhone(rec.name);
+    let siteIdx = -1;
+    if (phone) siteIdx = all.findIndex(r => r.testId === test.id && r.userPhone === phone);
+    if (siteIdx >= 0) siteIdxUsed.add(siteIdx);
+    if (hasRaw) {
+      const th = raschTheta(correct, tot);
+      if (th !== null && isFinite(th)) { combined.push({ name: rec.name, correct, total: tot, theta: th, siteIdx }); return; }
+    }
+    // faqat tayyor BALL berilgan (xom to'g'ri/jami yo'q) — theta hisoblab bo'lmaydi, ball o'zi saqlanadi
+    combined.push({ name: rec.name, correct: null, total: null, theta: null, siteIdx, directBall: rec.ball, directDaraja: rec.daraja });
+  });
+
+  // 2) Saytda shu testni topshirgan, lekin fayl orqali "yangilanmagan" (faylda yo'q) o'quvchilar
+  all.forEach((r, idx) => {
+    if (r.testId !== test.id || siteIdxUsed.has(idx)) return;
+    const correct = r.totalScore || 0;
+    const th = raschTheta(correct, total);
+    if (th === null || !isFinite(th)) return;
+    combined.push({ name: null, correct, total, theta: th, siteIdx: idx });
+  });
+
+  // 3) Umumiy o'rtacha/standart chetlanish — FAQAT theta hisoblangan yozuvlar bo'yicha (sayt + fayl birga)
+  const withTheta = combined.filter(e => e.theta !== null && e.theta !== undefined);
+  const mean = withTheta.length ? withTheta.reduce((a, b) => a + b.theta, 0) / withTheta.length : 0;
+  const variance = withTheta.length ? withTheta.reduce((a, b) => a + (b.theta - mean) ** 2, 0) / withTheta.length : 0;
+  const std = Math.sqrt(variance);
+  const range = settings.maxScore - settings.center;
+  const calculatedAt = Date.now();
+
+  let matched = 0;
+  const fileOnly = [];
+  const updated = all.map(r => ({ ...r }));
+  combined.forEach(e => {
+    let ball, zBall = null, theta = e.theta ?? null;
+    if (theta !== null) {
+      zBall = std !== 0 ? (theta - mean) / std : 0;
+      ball = range !== 0 ? settings.center + range * Math.tanh(10 * zBall / range) : settings.center;
+    } else {
+      ball = e.directBall;
+    }
+    const daraja = e.directDaraja || (typeof ball === "number" ? raschGrade(ball, settings) : null);
+    if (e.siteIdx >= 0) {
+      matched++;
+      updated[e.siteIdx] = { ...updated[e.siteIdx], rasch: {
+        correct: e.correct ?? updated[e.siteIdx].totalScore ?? null,
+        total: e.total ?? total,
+        theta, zBall, ball, daraja, calculatedAt, settings,
+        source: e.name ? "site+upload" : "site",
+      }};
+    } else if (e.name) {
+      fileOnly.push({ name: e.name, correct: e.correct, total: e.total, theta, zBall, ball, daraja });
+    }
+  });
+  db.set("results", updated);
+  return { matched, fileOnly, unusable, calculatedAt, combinedCount: combined.length };
+}
+
 // ===== EXCEL EXPORT (SheetJS .xlsx) =====
+
 // Ma'lumotni tayyorlab, DATA URL qaytaradi (avtomatik yuklab olishga urinmaydi).
 // Sabab: ko'plab embedded WebView muhitlar (masalan Telegram Mini App) dasturiy
 // ravishda (.click()) boshlangan yuklab olishlarni bloklaydi, lekin foydalanuvchi
 // O'ZI bosgan havolaga (haqiqiy user gesture) ruxsat beradi.
+// Mustaqil "Excel -> Rash" hisob-kitobi natijasini yuklab olinadigan .xlsx qilib tayyorlaydi.
+function buildRaschCalcExport(rows, settings) {
+  const header = ["#","F.I.O","Guruh","To'g'ri","Jami","Theta (θ)","Z-ball","BALL","Daraja"];
+  const sorted = [...rows].sort((a,b)=>(b.ball??-999)-(a.ball??-999));
+  const data = sorted.map((r,i)=>[i+1, r.name||"", r.group||"", r.correct??"", r.total??"", r.theta!=null?+r.theta.toFixed(4):"", r.zBall!=null?+r.zBall.toFixed(4):"", r.ball!=null?+r.ball.toFixed(2):"", r.daraja||""]);
+  if (typeof XLSX !== "undefined") {
+    try {
+      const ws = XLSX.utils.aoa_to_sheet([header, ...data]);
+      const range = XLSX.utils.decode_range(ws["!ref"]);
+      for (let C2 = range.s.c; C2 <= range.e.c; C2++) {
+        const addr = XLSX.utils.encode_cell({ r: 0, c: C2 });
+        if (ws[addr]) ws[addr].s = { font: { bold: true }, fill: { fgColor: { rgb: "6D28D9" } } };
+      }
+      ws["!cols"] = header.map((h,i)=>({ wch: i===1?26:12 }));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Rash natijalari");
+      const b64 = XLSX.write(wb, { bookType: "xlsx", type: "base64" });
+      return { dataUrl: `data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,${b64}`, filename: "rash_natijalari.xlsx", isBinary: true };
+    } catch {}
+  }
+  return null;
+}
+
 function buildExcelExport(test, results, users) {
   if (!test) return null;
   // Build question column list
@@ -1488,7 +1960,7 @@ function nodesToString(nodes) {
     if (n.type === "frac") { const num=slotVal(n.children[0]); const den=slotVal(n.children[1]); return `FRAC(${num},${den})`; }
     if (n.type === "sqrt") return `√(${slotVal(n.children[0])})`;
     if (n.type === "nthroot") { const deg=slotVal(n.children[0])||"n"; const arg=slotVal(n.children[1]); return `ROOT(${deg},${arg})`; }
-    if (n.type === "sup") { const b=slotVal(n.children[0]); const e=slotVal(n.children[1]); return b+"^"+e; }
+    if (n.type === "sup") { const b=slotVal(n.children[0]); const e=slotVal(n.children[1]); return `SUP(${b},${e})`; }
     if (n.type === "abs") return `|${slotVal(n.children[0])}|`;
     if (n.type === "mixedfrac") {
       const w=slotVal(n.children[0]); const nm=slotVal(n.children[1]); const dn=slotVal(n.children[2]);
@@ -1500,6 +1972,7 @@ function nodesToString(nodes) {
     }
     if (n.type === "defint") { const lo=slotVal(n.children[0]); const hi=slotVal(n.children[1]); const ex=slotVal(n.children[2]); const va=slotVal(n.children[3])||"x"; return "INT("+lo+","+hi+","+ex+","+va+")"; }
     if (n.type === "logbase") { const b=slotVal(n.children[0]); const a=slotVal(n.children[1]); return `LOG_BASE(${b},${a})`; }
+    if (n.type === "func") return `${n.value||""}(${slotVal(n.children[0])})`;
     return n.value || "";
   }).join("");
 }
@@ -1541,6 +2014,19 @@ function parseToNodes(str) {
         const num = comma >= 0 ? inner.slice(0, comma) : inner;
         const den = comma >= 0 ? inner.slice(comma + 1) : "";
         result.push(createNode("frac", "", [slotNode(parseToNodes(num)), slotNode(parseToNodes(den))]));
+        i = close + 1; continue;
+      }
+    }
+    // SUP(base,exp) — daraja (masalan x²)
+    if (str.startsWith("SUP(", i)) {
+      const openParen = i + 3;
+      const close = findClose(str, openParen);
+      if (close !== -1) {
+        const inner = str.slice(openParen + 1, close);
+        const comma = findTopComma(inner);
+        const base = comma >= 0 ? inner.slice(0, comma) : inner;
+        const exp  = comma >= 0 ? inner.slice(comma + 1) : "";
+        result.push(createNode("sup", "", [slotNode(parseToNodes(base)), slotNode(parseToNodes(exp))]));
         i = close + 1; continue;
       }
     }
@@ -1614,6 +2100,7 @@ function parseToNodes(str) {
       const ch = str[j];
       if (str.startsWith("FRAC(", j) || str.startsWith("LOG_BASE(", j) ||
           str.startsWith("ROOT(", j) || str.startsWith("INT(", j) ||
+          str.startsWith("SUP(", j) ||
           str.startsWith("√(", j) || ch === "|") break;
       j++;
     }
@@ -1652,14 +2139,15 @@ function renderSlot(slot, cursor, setCursor, style={}) {
     if(n.children)return n.children.some(c=>c&&c.nodes&&c.nodes.some(nn=>nn.id===cursor));
     return false;
   });
-  const bg = isActive?"rgba(99,102,241,0.13)":isEmpty?"rgba(251,191,36,0.18)":"transparent";
-  const brd = isActive?"1.5px solid #6366F1":isEmpty?"1.5px solid #F59E0B":"1px solid #E2E8F0";
+  const bg = isActive?"rgba(99,102,241,0.13)":isEmpty?"#E9EAEE":"transparent";
+  const brd = isActive?"1.5px solid #6366F1":isEmpty?"1.5px solid #CBD5E1":"1px solid #E2E8F0";
   return (
     <span style={{ display:"inline-flex", alignItems:"center", flexWrap:"nowrap",
-      minWidth:18, minHeight:22, padding:"0 3px", background:bg, border:brd, borderRadius:5, cursor:"text", verticalAlign:"middle", ...style,
+      minWidth:18, minHeight:22, padding:"0 3px", background:bg, border:brd, borderRadius:5, cursor:"text", verticalAlign:"middle",
+      animation:isActive?"slotPulse 1.1s ease-in-out infinite":"none", ...style,
     }} onClick={e=>{e.stopPropagation(); if(isEmpty||!isActive){const first=nodes.find(n=>n.type==="text");if(first)setCursor(first.id);}}}>
       {isEmpty
-        ? <span style={{color:isActive?"#6366F1":"#F59E0B",fontSize:12,fontWeight:700}}>□</span>
+        ? (isActive?<span style={{display:"inline-block",width:2,height:16,background:"#6366F1",borderRadius:1,animation:"blink 1s step-end infinite"}}/>:null)
         : nodes.map(n=>renderNode(n,cursor,setCursor))
       }
     </span>
@@ -1733,6 +2221,14 @@ function renderNode(node, cursor, setCursor) {
       </span>
     </span>
   );
+  if (node.type==="func") return (
+    <span key={node.id} style={{...base,verticalAlign:"middle",margin:"0 2px",alignItems:"center"}}>
+      <span style={{fontSize:20,color:"#1E293B",fontFamily:"KaTeX_Main,serif"}}>{node.value}</span>
+      <span style={{fontSize:20,color:"#1E293B",fontFamily:"KaTeX_Main,serif"}}>(</span>
+      {renderSlot(node.children[0],cursor,setCursor)}
+      <span style={{fontSize:20,color:"#1E293B",fontFamily:"KaTeX_Main,serif"}}>)</span>
+    </span>
+  );
   if (node.type==="logbase") return (
     <span key={node.id} style={{...base,verticalAlign:"middle",margin:"0 2px",alignItems:"flex-end"}}>
       <span style={{fontSize:18,color:"#1E293B",fontFamily:"KaTeX_Main,serif"}}>log</span>
@@ -1763,21 +2259,7 @@ function renderNode(node, cursor, setCursor) {
 function calcResult(str) {
   if (!str) return null;
   try {
-    const norm = (s) => {
-      let r = s;
-      let prev = "";
-      let _ci=0; while (prev !== r && _ci++<30) { prev = r; r = r.replace(/FRAC\(([^()]+),([^()]+)\)/g, "($1)/($2)"); }
-      r = r.replace(/ROOT\(([^,]+),([^)]+)\)/g, "nthRoot($2,$1)");
-      r = r.replace(/LOG_BASE\(([^,]+),([^)]+)\)/g, "log($2,$1)");
-      r = r.replace(/√\(([^)]+)\)/g, "sqrt($1)");
-      r = r.replace(/√(\w+)/g, "sqrt($1)");
-      r = r.replace(/π/g, "pi");
-      r = r.replace(/×/g, "*");
-      r = r.replace(/÷/g, "/");
-      r = r.replace(/INT\([^)]+\)/g, "0");
-      return r;
-    };
-    const expr = norm(str);
+    const expr = toMathJs(str);
     if (!expr || expr.length < 1) return null;
     if (window.math) {
       const result = window.math.evaluate(expr);
@@ -1797,11 +2279,18 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
   const [tab, setTab] = useState("basic");
   const [popup, setPopup] = useState(null);
   const [calcVal, setCalcVal] = useState(null);
-  const [angleMode, setAngleMode] = useState("deg"); // deg | rad
   const [shiftMode, setShiftMode] = useState(false); // lowercase/uppercase Latin
   const holdRef = useRef(null);
 
   const [katexReady, setKatexReady] = useState(!!window.katex);
+  const [cursorBlink, setCursorBlink] = useState(true);
+
+  // Vertikal kursor chizig'ini haqiqiy klaviaturalardagi kabi o'chib-yonib turishini
+  // ta'minlaydi (500ms har birida ko'rinadi/yashiriladi).
+  useEffect(() => {
+    const iv = setInterval(() => setCursorBlink(b => !b), 500);
+    return () => clearInterval(iv);
+  }, []);
 
   useEffect(() => {
     const collectAll = (ns) => {
@@ -1866,24 +2355,120 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
   };
 
   const insertChar = (ch) => setNodes(prev => updateTextNode(prev, cursor, v => v + ch));
-  const deleteChar = () => setNodes(prev => updateTextNode(prev, cursor, v => v.slice(0, -1)));
+  // Aqlli o'chirish: joriy joy bo'sh bo'lmasa — oxirgi belgini o'chiradi (avvalgidek).
+  // Joriy joy BO'SH bo'lsa: agar shu tuzilma (masalan kasr)ning barcha qismlari bo'sh
+  // bo'lsa — butun tuzilmani olib tashlab, atrofdagi matnni birlashtiradi (Desmos kabi).
+  // Aks holda — kursorni oldingi joyga o'tkazadi.
+  const deleteChar = () => {
+    const curNode = collectTextNodes(nodes).find(t => t.id === cursor);
+    if (curNode && curNode.value) {
+      setNodes(prev => updateTextNode(prev, cursor, v => v.slice(0, -1)));
+      return;
+    }
+    let newCursor = cursor;
+    let handled = false;
+    const process = (list) => {
+      const out = [];
+      for (let i = 0; i < list.length; i++) {
+        const n = list[i];
+        if (!handled && n.children && n.children.some(s => s?.nodes)) {
+          const containsCursor = n.children.some(s => s?.nodes && collectTextNodes(s.nodes).some(t => t.id === cursor));
+          if (containsCursor) {
+            const allSlotsEmpty = n.children.every(s => !s?.nodes || collectTextNodes(s.nodes).every(t => !t.value));
+            handled = true;
+            if (allSlotsEmpty) {
+              // Tuzilmani butunlay olib tashlab, chap va o'ng matnni birlashtiramiz
+              const prevNode = out[out.length - 1];
+              const nextNode = list[i + 1];
+              if (prevNode && prevNode.type === "text" && nextNode && nextNode.type === "text") {
+                out[out.length - 1] = { ...prevNode, value: prevNode.value + nextNode.value };
+                newCursor = prevNode.id;
+                i++; continue;
+              } else if (prevNode && prevNode.type === "text") {
+                newCursor = prevNode.id; continue;
+              } else if (nextNode && nextNode.type === "text") {
+                newCursor = nextNode.id; out.push(nextNode); i++; continue;
+              } else {
+                const nt = { id: uid(), type: "text", value: "", nodes: null };
+                newCursor = nt.id; out.push(nt); continue;
+              }
+            } else {
+              // Boshqa qismida matn bor — shunchaki kursorni oldingi joyga o'tkazamiz
+              const all = collectTextNodes(nodes);
+              const idx = all.findIndex(t => t.id === cursor);
+              if (idx > 0) newCursor = all[idx - 1].id;
+              out.push(n); continue;
+            }
+          }
+        }
+        if (!handled && n.type === "slot" && n.nodes) {
+          const u = process(n.nodes);
+          out.push(u !== n.nodes ? { ...n, nodes: u } : n);
+          continue;
+        }
+        if (!handled && n.children) {
+          const uc = n.children.map(s => { if (!s?.nodes) return s; const u = process(s.nodes); return u !== s.nodes ? { ...s, nodes: u } : s; });
+          out.push(uc.some((c, i2) => c !== n.children[i2]) ? { ...n, children: uc } : n);
+          continue;
+        }
+        out.push(n);
+      }
+      return out;
+    };
+    const result = process(nodes);
+    if (handled) {
+      setNodes(result);
+      setCursor(newCursor);
+      return;
+    }
+    // Tuzilma topilmadi (eng tashqi darajadagi bo'sh joy) — kursorni oldingi joyga o'tkazamiz
+    const all = collectTextNodes(nodes);
+    const idx = all.findIndex(t => t.id === cursor);
+    if (idx > 0) setCursor(all[idx - 1].id);
+  };
   const clearAll = () => { const r = { id: uid(), type: "text", value: "", nodes: null }; setNodes([r]); setCursor(r.id); };
 
   const movePrev = () => { const all = collectTextNodes(nodes); const i = all.findIndex(n => n.id === cursor); if (i > 0) setCursor(all[i - 1].id); };
   const moveNext = () => { const all = collectTextNodes(nodes); const i = all.findIndex(n => n.id === cursor); if (i >= 0 && i < all.length - 1) setCursor(all[i + 1].id); };
 
-  const insertStructure = (type) => {
+  const insertStructure = (type, fnName) => {
     const after = { id: uid(), type: "text", value: "", nodes: null };
     let struct = null;
     if (type === "frac") struct = createNode("frac", "", [slotNode(), slotNode()]);
     else if (type === "sqrt") struct = createNode("sqrt", "", [slotNode()]);
     else if (type === "nthroot") struct = createNode("nthroot", "", [slotNode(), slotNode()]);
     else if (type === "cbrt") { const ds = slotNode([textNode("3")]); const as2 = slotNode(); struct = createNode("nthroot", "", [ds, as2]); const a2 = textNode(""); setNodes(prev => insertStructureInto(prev, cursor, struct, a2)); setCursor(as2.nodes[0]?.id); return; }
-    else if (type === "sup") struct = createNode("sup", "", [slotNode(), slotNode()]);
+    else if (type === "sup") {
+      // Masalan foydalanuvchi "5" yozib, keyin daraja (x²) tugmasini bossa — "5" endi
+      // yangi darajaning ASOSIGA (bazasiga) avtomatik ko'chiriladi, va kursor darhol
+      // daraja qismiga o'tadi — foydalanuvchi to'g'ridan-to'g'ri "2" ni yoza oladi va
+      // natijada to'g'ri "5²" hosil bo'ladi (avvalgidek bo'sh "^" chiqib qolmaydi).
+      // MUHIM: agar joriy matnda oldin operator ham bo'lsa (masalan "3²+4" yozilgan
+      // bo'lsa-yu, "+4" bitta tugunda tursa), FAQAT oxirgi son/harf qismi ("4") bazaga
+      // olinadi, "+" belgisi esa formulada joyida (alohida matn sifatida) qoladi —
+      // aks holda "+" yo'qolib, ikkita had bir-biriga ko'paytirilgandek hisoblanib
+      // qolardi (masalan √(3²+4²) noto'g'ri √(3²·4²) bo'lib qolishi mumkin edi).
+      const curNode = collectTextNodes(nodes).find(n => n.id === cursor);
+      const fullVal = curNode ? curNode.value : "";
+      const m = fullVal.match(/^(.*?)([0-9a-zA-Z.\u03c0]*)$/);
+      const prefix = m ? m[1] : "";
+      const baseVal = m ? m[2] : fullVal;
+      const baseSlot = slotNode(baseVal ? [textNode(baseVal)] : []);
+      const expSlot = slotNode();
+      struct = createNode("sup", "", [baseSlot, expSlot]);
+      setNodes(prev => {
+        // Operator (prefix) qismi joriy tugunda qoladi, faqat baza qismi olib tashlanadi
+        const cleared = fullVal ? updateTextNode(prev, cursor, () => prefix) : prev;
+        return insertStructureInto(cleared, cursor, struct, after);
+      });
+      setCursor((expSlot.nodes && expSlot.nodes[0]?.id) || after.id);
+      return;
+    }
     else if (type === "abs") struct = createNode("abs", "", [slotNode()]);
     else if (type === "logbase") struct = createNode("logbase", "", [slotNode(), slotNode()]);
     else if (type === "mixedfrac") struct = createNode("mixedfrac", "", [slotNode(), slotNode(), slotNode()]);
     else if (type === "defint") { const xSlot = slotNode([textNode("x")]); struct = createNode("defint", "", [slotNode(), slotNode(), slotNode(), xSlot]); }
+    else if (type === "func") struct = createNode("func", fnName || "", [slotNode()]);
     if (!struct) return;
     setNodes(prev => insertStructureInto(prev, cursor, struct, after));
     const fs = struct.children && struct.children[0];
@@ -1897,7 +2482,7 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
     if (btn.c === "PREV") { movePrev(); return; }
     if (btn.c === "NEXT") { moveNext(); return; }
     if (btn.c === "SHIFT") { setShiftMode(m => !m); return; }
-    if (btn.struct) { insertStructure(btn.struct); return; }
+    if (btn.struct) { insertStructure(btn.struct, btn.fn); return; }
     if (btn.c) {
       insertChar(btn.c);
       // After inserting uppercase letter, auto-switch back to lowercase
@@ -1929,91 +2514,96 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
         { lt:"x^{2}", struct:"sup", dot:true, sub:[{lt:"x^{3}",struct:"cbrt"},{lt:"x^{n}",struct:"sup"}] },
         { lt:"\\frac{\\square}{\\square}", struct:"frac", dot:true, sub:[{lt:"\\square\\frac{\\square}{\\square}",struct:"mixedfrac"}] },
         { lt:"\\sqrt{\\square}", struct:"sqrt", dot:true, sub:[{lt:"\\sqrt[3]{\\square}",struct:"cbrt"},{lt:"\\sqrt[n]{\\square}",struct:"nthroot"}] },
-        { l:"ln", c:"ln(", lt:"\\ln", dot:true, sub:[{l:"lg",c:"lg(",lt:"\\lg"},{lt:"\\log_{\\square}",struct:"logbase"},{l:"log",c:"log(",lt:"\\log"}] },
         { l:"(", c:"(", op:true, dot:true, sub:[{l:"[",c:"["},{l:"{",c:"{"}] },
         { l:")", c:")", op:true, dot:true, sub:[{l:"]",c:"]"},{l:"}",c:"}"}] },
-      ],
-      [
-        { l:"sin", c:"sin(", lt:"\\sin" },
-        { l:"cos", c:"cos(", lt:"\\cos" },
-        { l:"tan", c:"tan(", lt:"\\tan" },
-        { l:"e", c:"e", lt:"e" },
-        { l:"π", c:"π", lt:"\\pi" },
-        { l:"⌫", c:"DEL", del:true },
+        { l:"°", c:"°", lt:"^{\\circ}" },
       ],
       [
         { l:"7", c:"7", num:true },
         { l:"8", c:"8", num:true },
         { l:"9", c:"9", num:true },
         { l:"÷", c:"/", lt:"\\div", op:true },
-        { l:"×", c:"*", lt:"\\times", op:true },
+        { l:"e", c:"e", lt:"e" },
         { l:"C", c:"CLR", clr:true },
       ],
       [
         { l:"4", c:"4", num:true },
         { l:"5", c:"5", num:true },
         { l:"6", c:"6", num:true },
-        { l:"−", c:"-", op:true },
-        { l:"+", c:"+", op:true },
-        { l:"=", c:"=", eq:true },
+        { l:"×", c:"*", lt:"\\times", op:true },
+        { l:"π", c:"π", lt:"\\pi" },
+        { l:"⌫", c:"DEL", del:true },
       ],
       [
         { l:"1", c:"1", num:true },
         { l:"2", c:"2", num:true },
         { l:"3", c:"3", num:true },
-        { l:",", c:",", num:true },
-        { l:";", c:";", op:true },
-        { l:"←", c:"PREV", nav:true },
+        { l:"−", c:"-", op:true },
+        { l:"+", c:"+", op:true },
+        { l:"±", c:"±", lt:"\\pm", op:true },
       ],
       [
+        { l:"ln", struct:"func", fn:"ln", lt:"\\ln", dot:true, sub:[{l:"lg",struct:"func",fn:"lg",lt:"\\lg"},{l:"log",struct:"logbase",lt:"\\log_{\\square}"}] },
         { l:"0", c:"0", num:true },
-        { l:"x", c:"x", op:true },
-        { l:"±", c:"±", lt:"\\pm", op:true },
+        { l:",", c:",", num:true },
+        { l:"x", c:"x", op:true, dot:true, sub:[{l:"y",c:"y"},{l:"z",c:"z"}] },
+        { l:"=", c:"=", eq:true },
+        { l:";", c:";", op:true },
+      ],
+    ],
+    trig: [
+      [
+        { l:"sin", struct:"func", fn:"sin", lt:"\\sin" },
+        { l:"cos", struct:"func", fn:"cos", lt:"\\cos" },
+        { l:"tan", struct:"func", fn:"tan", lt:"\\tan" },
+        { l:"asin", struct:"func", fn:"arcsin", lt:"\\arcsin" },
+        { l:"acos", struct:"func", fn:"arccos", lt:"\\arccos" },
+        { l:"atan", struct:"func", fn:"arctan", lt:"\\arctan" },
+      ],
+      [
+        { l:"sinh", struct:"func", fn:"sinh", lt:"\\sinh" },
+        { l:"cosh", struct:"func", fn:"cosh", lt:"\\cosh" },
+        { l:"tanh", struct:"func", fn:"tanh", lt:"\\tanh" },
+        { l:"ln", struct:"func", fn:"ln", lt:"\\ln" },
+        { l:"lg", struct:"func", fn:"lg", lt:"\\lg" },
+        { l:"log", struct:"logbase", lt:"\\log_{\\square}" },
+      ],
+      [
+        { l:"°", c:"°", lt:"^{\\circ}" },
         { l:"π", c:"π", lt:"\\pi" },
-        { l:"%", c:"%", op:true },
-        { l:"→", c:"NEXT", nav:true },
+        { l:"α", c:"α", lt:"\\alpha" },
+        { l:"β", c:"β", lt:"\\beta" },
+        { l:"γ", c:"γ", lt:"\\gamma" },
+        { l:"θ", c:"θ", lt:"\\theta" },
+      ],
+      [
+        { l:"λ", c:"λ", lt:"\\lambda" },
+        { l:"μ", c:"μ", lt:"\\mu" },
+        { l:"⌫", c:"DEL", del:true },
       ],
     ],
     extra: [
       [
-        { l:"asin", c:"arcsin(", lt:"\\arcsin" },
-        { l:"acos", c:"arccos(", lt:"\\arccos" },
-        { l:"atan", c:"arctan(", lt:"\\arctan" },
         { l:"|x|", struct:"abs", lt:"|\\square|" },
         { l:"n!", c:"!", lt:"n!" },
-      ],
-      [
-        { l:"sinh", c:"sinh(", lt:"\\sinh" },
-        { l:"cosh", c:"cosh(", lt:"\\cosh" },
-        { l:"tanh", c:"tanh(", lt:"\\tanh" },
         { l:"∞", c:"∞", lt:"\\infty" },
+        { l:"≈", c:"≈", lt:"\\approx" },
         { l:"%", c:"%", op:true },
-      ],
-      [
-        { l:"α", c:"α", lt:"\\alpha" },
-        { l:"β", c:"β", lt:"\\beta" },
-        { l:"θ", c:"θ", lt:"\\theta" },
-        { l:"λ", c:"λ", lt:"\\lambda" },
-        { l:"μ", c:"μ", lt:"\\mu" },
-      ],
-      [
         { l:"<", c:"<", dot:true, sub:[{l:"≤",c:"≤",lt:"\\leq"}] },
+      ],
+      [
         { l:">", c:">", dot:true, sub:[{l:"≥",c:"≥",lt:"\\geq"}] },
         { l:"≠", c:"≠", lt:"\\neq" },
-        { l:"±", c:"±", lt:"\\pm" },
-        { l:"°", c:"°", lt:"^{\\circ}" },
-      ],
-      [
         { l:"∫", struct:"defint", lt:"\\int_{a}^{b}" },
         { l:"∑", c:"∑", lt:"\\sum" },
         { l:"∂", c:"∂", lt:"\\partial" },
         { l:"∈", c:"∈", lt:"\\in" },
-        { l:"≡", c:"≡", lt:"\\equiv" },
       ],
       [
+        { l:"≡", c:"≡", lt:"\\equiv" },
         { l:"[", c:"[" }, { l:"]", c:"]" },
         { l:"{", c:"{" }, { l:"}", c:"}" },
-        { l:"→", c:"NEXT", nav:true },
+        { l:"⌫", c:"DEL", del:true },
       ],
     ],
     // latin: generated dynamically based on shiftMode
@@ -2033,23 +2623,21 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
       ...latinLetters.slice(24,26).map(l => ({ l, c:l, lat:true })),
       { l: shiftMode ? "⇧" : "⇪", c:"SHIFT", shift:true },
       { l:"⌫", c:"DEL", del:true },
-      { l:"←", c:"PREV", nav:true },
-      { l:"→", c:"NEXT", nav:true },
     ],
   ];
 
   const rows = tab === "latin" ? latinRows : (KEYS[tab] || KEYS.basic);
 
   const btnStyle = (btn) => {
-    if (btn.num)   return { bg: "#FFFFFF", fg: "#1E293B", brd: "#DDE3F0", fs: 22, fw: 700, ff: "'SF Mono',monospace" };
-    if (btn.del)   return { bg: "#FEF2F2", fg: "#EF4444", brd: "#FECACA", fs: 18, fw: 700, ff: "inherit" };
-    if (btn.clr)   return { bg: "#FFF7ED", fg: "#EA580C", brd: "#FED7AA", fs: 15, fw: 700, ff: "inherit" };
-    if (btn.op)    return { bg: "#F1F5FF", fg: "#4338CA", brd: "#C7D2FE", fs: 17, fw: 700, ff: "inherit" };
-    if (btn.eq)    return { bg: "#6366F1", fg: "#FFFFFF", brd: "#4F46E5", fs: 17, fw: 800, ff: "inherit" };
-    if (btn.nav)   return { bg: "#EEF1FF", fg: "#4F46E5", brd: "#C7D2FE", fs: 18, fw: 700, ff: "inherit" };
-    if (btn.shift) return { bg: shiftMode ? "#6366F1" : "#E0E7FF", fg: shiftMode ? "#FFFFFF" : "#4338CA", brd: "#C7D2FE", fs: 16, fw: 700, ff: "inherit" };
-    if (btn.lat)   return { bg: "#FFFBF0", fg: "#92400E", brd: "#FDE68A", fs: 20, fw: 700, ff: "'KaTeX_Math','Computer Modern',Georgia,serif" };
-    return { bg: "#EEF1FF", fg: "#3730A3", brd: "#C7D2FE", fs: 13, fw: 600, ff: "inherit" };
+    if (btn.num)   return { bg: "#FFFFFF", fg: "#1E293B", brd: "#DDE3F0", fs: 18, fw: 700, ff: "'SF Mono',monospace" };
+    if (btn.del)   return { bg: "#FEF2F2", fg: "#EF4444", brd: "#FECACA", fs: 16, fw: 700, ff: "inherit" };
+    if (btn.clr)   return { bg: "#FFF7ED", fg: "#EA580C", brd: "#FED7AA", fs: 13, fw: 700, ff: "inherit" };
+    if (btn.op)    return { bg: "#F1F5FF", fg: "#4338CA", brd: "#C7D2FE", fs: 15, fw: 700, ff: "inherit" };
+    if (btn.eq)    return { bg: "#6366F1", fg: "#FFFFFF", brd: "#4F46E5", fs: 15, fw: 800, ff: "inherit" };
+    if (btn.nav)   return { bg: "#EEF1FF", fg: "#4F46E5", brd: "#C7D2FE", fs: 15, fw: 700, ff: "inherit" };
+    if (btn.shift) return { bg: shiftMode ? "#6366F1" : "#E0E7FF", fg: shiftMode ? "#FFFFFF" : "#4338CA", brd: "#C7D2FE", fs: 14, fw: 700, ff: "inherit" };
+    if (btn.lat)   return { bg: "#FFFBF0", fg: "#92400E", brd: "#FDE68A", fs: 17, fw: 700, ff: "'KaTeX_Math','Computer Modern',Georgia,serif" };
+    return { bg: "#EEF1FF", fg: "#3730A3", brd: "#C7D2FE", fs: 12, fw: 600, ff: "inherit" };
   };
 
   const currentStr = nodesToString(nodes);
@@ -2064,78 +2652,112 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
       fontFamily: "'SF Pro Display','Segoe UI',system-ui,sans-serif",
       overflow: "visible",
     }}>
-      {/* ── TOP BAR: input display + calculator result ── */}
+      {/* ── LIVE FORMULA PREVIEW + OK ── Klaviatura ekranning pastki qismini butunlay
+           egallab, javob maydonining o'zini yopib qo'yishi mumkin — shu sabab
+           yozilayotgan formula shu yerda, klaviaturaning o'zida, haqiqiy vaqtda
+           (real-time) KaTeX bilan ko'rsatiladi. Kursor — formulaning ICHIDA,
+           aynan yozilayotgan joyda, chinakam yonib-o'chib turadigan VERTIKAL
+           chiziq sifatida ko'rinadi (alohida oynachada emas). */}
       <div style={{
-        background: "#FFFFFF",
-        borderBottom: "1.5px solid #E0E7FF",
+        background: "#FAFBFF", borderBottom: "1.5px solid #E0E7FF",
         borderRadius: "20px 20px 0 0",
-        padding: "10px 12px",
+        padding: "8px 10px", minHeight: 40, maxHeight: 60,
         display: "flex", alignItems: "center", gap: 8,
       }}>
-        <button onClick={movePrev} style={{ width: 34, height: 34, background: "#EEF1FF", border: "1px solid #C7D2FE", borderRadius: 9, color: "#4F46E5", fontSize: 16, cursor: "pointer", fontWeight: 700, flexShrink: 0 }}>←</button>
-        <button onClick={moveNext} style={{ width: 34, height: 34, background: "#EEF1FF", border: "1px solid #C7D2FE", borderRadius: 9, color: "#4F46E5", fontSize: 16, cursor: "pointer", fontWeight: 700, flexShrink: 0 }}>→</button>
-
-        {/* Formula display */}
-        <div
-          onClick={e => { e.stopPropagation(); const all = collectTextNodes(nodes); const last = all[all.length - 1]; if (last) setCursor(last.id); }}
-          style={{
-            flex: 1, minHeight: 44, background: "#F8FAFF",
-            border: "2px solid #6366F1", borderRadius: 10, padding: "6px 12px",
-            display: "flex", alignItems: "center", flexWrap: "wrap", gap: 3,
-            cursor: "text", overflowX: "auto",
-            boxShadow: "0 0 0 3px rgba(99,102,241,0.1)",
-          }}>
-          {nodes.length === 0 || (nodes.length === 1 && nodes[0].type === "text" && !nodes[0].value)
-            ? <span style={{ color: "#94A3B8", fontSize: 15 }}>Javob yozing...</span>
-            : nodes.map(n => renderNode(n, cursor, id => setCursor(id)))
-          }
+        <div style={{ flex: 1, overflowX: "auto", overflowY: "hidden", display: "flex", alignItems: "center", gap: 3 }}>
+          {(() => {
+            const realStr = nodesToString(nodes);
+            // Formula bo'sh bo'lsa — placeholder matn + (miltillasa) boshida kursor.
+            if (!realStr) {
+              let cursorHtml = null;
+              try { cursorHtml = ks(cursorBlink ? "\\textcolor{#6366F1}{\\rule{0.1em}{0.95em}}" : "\\textcolor{#FAFBFF}{\\rule{0.1em}{0.95em}}"); } catch { cursorHtml = null; }
+              return (
+                <>
+                  {cursorHtml && <span dangerouslySetInnerHTML={{ __html: cursorHtml }} style={{ color: "#6366F1" }}/>}
+                  <span style={{ fontSize: 13, color: "#94A3B8" }}>Formula shu yerda ko'rinadi...</span>
+                </>
+              );
+            }
+            // Kursor turgan text-node'ning oxiriga ko'rinmas maxsus belgi (marker)
+            // qo'shiladi. U toLatex orqali o'zgarishsiz o'tadi (chunki hech qanday
+            // maxsus belgi/funksiya bilan mos kelmaydi), so'ng LaTeX matni tayyor
+            // bo'lgach, o'sha belgi haqiqiy KaTeX \rule (vertikal chiziqcha) bilan
+            // almashtiriladi — shu bilan kursor formulaning ICHIDA, aynan to'g'ri
+            // joyda (hattoki kasr yoki ildiz ichida bo'lsa ham) chiqadi.
+            const CURSOR_MARK = "\u0001";
+            const withCursorMark = (list) => list.map(n => {
+              if (n.id === cursor && n.type === "text") return { ...n, value: n.value + CURSOR_MARK };
+              if (n.type === "slot" && n.nodes) return { ...n, nodes: withCursorMark(n.nodes) };
+              if (n.children) return { ...n, children: n.children.map(s => s && s.nodes ? { ...s, nodes: withCursorMark(s.nodes) } : s) };
+              return n;
+            });
+            const str = nodesToString(withCursorMark(nodes));
+            let html = null;
+            try {
+              let latex = toLatex(str.startsWith("$") ? str.slice(1, -1) : str);
+              // MUHIM: chiziqcha balandligini o'zgartirmaymiz (0 qilib yubormaymiz) —
+              // aks holda KaTeX qator balandligini qayta hisoblab, atrofdagi
+              // belgilar har miltillaganda "sakrab" katta-kichik bo'lib ko'rinardi.
+              // Shuning uchun o'lcham DOIM bir xil, faqat rangi (ko'rinish/yo'qolish)
+              // almashadi — shu bilan formula matni butunlay qimirlamaydi.
+              const cursorLatex = cursorBlink ? "\\textcolor{#6366F1}{\\rule{0.1em}{0.95em}}" : "\\textcolor{#FAFBFF}{\\rule{0.1em}{0.95em}}";
+              latex = latex.split(CURSOR_MARK).join(cursorLatex);
+              html = latex ? ks(latex) : null;
+            } catch { html = null; }
+            return html
+              ? <span dangerouslySetInnerHTML={{ __html: html }} style={{ fontSize: 17, whiteSpace: "nowrap", color: "#1E293B" }}/>
+              : <span style={{ fontSize: 13, color: "#94A3B8" }}>Formula shu yerda ko'rinadi...</span>;
+          })()}
         </div>
-
         {/* Result badge — faqat admin uchun */}
         {isAdmin && calcVal !== null && (
           <div style={{
             background: "linear-gradient(135deg,#4F46E5,#7C3AED)",
-            color: "white", borderRadius: 10, padding: "6px 12px",
-            fontSize: 15, fontWeight: 800, flexShrink: 0,
+            color: "white", borderRadius: 8, padding: "4px 10px",
+            fontSize: 13, fontWeight: 800, flexShrink: 0,
             boxShadow: "0 2px 8px rgba(99,102,241,0.3)",
-            maxWidth: 110, overflow: "hidden", textOverflow: "ellipsis",
+            maxWidth: 100, overflow: "hidden", textOverflow: "ellipsis",
             whiteSpace: "nowrap",
           }}>
             = {calcVal}
           </div>
         )}
+        <button onClick={onClose} style={{ padding: "6px 12px", background: "#6366F1", border: "none", borderRadius: 8, color: "white", fontWeight: 800, fontSize: 12, cursor: "pointer", flexShrink: 0 }}>OK ✓</button>
+      </div>
 
-        <button onClick={deleteChar} style={{ width: 34, height: 34, background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: 9, color: "#EF4444", fontSize: 16, cursor: "pointer", flexShrink: 0 }}>⌫</button>
-        <button onClick={onClose} style={{ padding: "8px 14px", background: "#6366F1", border: "none", borderRadius: 9, color: "white", fontWeight: 800, fontSize: 13, cursor: "pointer", flexShrink: 0 }}>OK ✓</button>
+      {/* ── NAV ROW: ← → — oynada yozilgan formulani ko'rib, kursorni bo'lak-bo'lak
+           orasida siljitish uchun preview ostida joylashgan ── */}
+      <div style={{
+        background: "#FFFFFF", borderBottom: "1px solid #DDE3F0",
+        padding: "5px 10px", display: "flex", justifyContent: "center", alignItems: "center", gap: 8,
+      }}>
+        <button onClick={movePrev} style={{ width: 68, height: 28, background: "#EEF1FF", border: "1px solid #C7D2FE", borderRadius: 8, color: "#4F46E5", fontSize: 14, cursor: "pointer", fontWeight: 700, flexShrink: 0 }}>←</button>
+        <button onClick={moveNext} style={{ width: 68, height: 28, background: "#EEF1FF", border: "1px solid #C7D2FE", borderRadius: 8, color: "#4F46E5", fontSize: 14, cursor: "pointer", fontWeight: 700, flexShrink: 0 }}>→</button>
       </div>
 
       {/* ── TAB ROW ── */}
       <div style={{ display: "flex", background: "#F1F5FF", borderBottom: "1px solid #DDE3F0" }}>
-        {[["basic", "Asosiy"], ["extra", "Qo'shimcha"], ["latin", "Lotin"]].map(([t, l]) => (
+        {[["basic", "Asosiy"], ["trig", "Trig/log"], ["extra", "Qo'shimcha"], ["latin", "Lotin"]].map(([t, l]) => (
           <button key={t} onClick={() => setTab(t)} style={{
-            flex: 1, padding: "9px 4px",
+            flex: 1, padding: "8px 3px",
             background: tab === t ? "#FFFFFF" : "transparent",
-            border: "none", borderBottom: tab === t ? "2.5px solid #6366F1" : "2.5px solid transparent",
+            border: "none", borderBottom: tab === t ? "2px solid #6366F1" : "2px solid transparent",
             color: tab === t ? "#4F46E5" : "#94A3B8",
-            fontWeight: tab === t ? 800 : 500, fontSize: 13, cursor: "pointer",
+            fontWeight: tab === t ? 800 : 500, fontSize: 12, cursor: "pointer",
           }}>{l}</button>
         ))}
-        {/* Angle mode toggle */}
-        <button onClick={() => setAngleMode(m => m === "deg" ? "rad" : "deg")} style={{
-          padding: "9px 14px", background: "transparent", border: "none",
-          borderBottom: "2.5px solid transparent",
-          color: "#64748B", fontSize: 12, cursor: "pointer", fontWeight: 600,
-          flexShrink: 0,
-        }}>
-          <span style={{ background: "#E0E7FF", borderRadius: 6, padding: "3px 8px", color: "#4338CA" }}>{angleMode.toUpperCase()}</span>
-        </button>
       </div>
 
-      {/* ── KEY GRID (Desmos layout: 5 columns × 6 rows) ── */}
-      <div style={{ padding: "8px 8px 16px", background: "#FFFFFF" }}>
-        {rows.map((row, ri) => (
-          <div key={ri} style={{ display: "grid", gridTemplateColumns: `repeat(${row.length}, 1fr)`, gap: 5, marginBottom: 5 }}>
-            {row.map((btn, ci) => {
+      {/* ── KEY GRID (ixcham, har doim 6 ustunli — bo'limlar orasida o'lcham sakramasligi uchun
+           balandlik ham doimiy ushlab turiladi) ── */}
+      <div style={{ padding: "6px 6px 10px", background: "#FFFFFF", minHeight: 236, boxSizing: "border-box" }}>
+        {rows.map((row, ri) => {
+          const GRID_COLS = 6;
+          const padded = row.length < GRID_COLS ? [...row, ...Array(GRID_COLS - row.length).fill(null)] : row;
+          return (
+          <div key={ri} style={{ display: "grid", gridTemplateColumns: `repeat(${GRID_COLS}, 1fr)`, gap: 4, marginBottom: 4 }}>
+            {padded.map((btn, ci) => {
+              if (!btn) return <div key={ci} aria-hidden="true"/>;
               const st = btnStyle(btn);
               const khtml = ks(btn.lt);
               const hasSub = btn.sub?.length > 0;
@@ -2145,29 +2767,30 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
                   onPointerUp={() => endHold(btn)}
                   onPointerCancel={() => { if (holdRef.current) { clearTimeout(holdRef.current); holdRef.current = null; } }}
                   style={{
-                    minHeight: 50, background: st.bg,
-                    border: `1.5px solid ${st.brd}`, borderRadius: 12,
+                    minHeight: 38, background: st.bg,
+                    border: `1.5px solid ${st.brd}`, borderRadius: 10,
                     color: st.fg, fontSize: st.fs, fontWeight: st.fw,
                     fontFamily: st.ff || "inherit",
                     fontStyle: btn.lat ? "italic" : "normal",
                     cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
                     position: "relative", WebkitTapHighlightColor: "transparent",
-                    boxShadow: "0 2px 0 rgba(0,0,0,0.07)", userSelect: "none",
-                    padding: "3px 2px", transition: "all 0.1s",
+                    boxShadow: "0 1.5px 0 rgba(0,0,0,0.07)", userSelect: "none",
+                    padding: "2px 2px", transition: "all 0.1s",
                   }}
                   onPointerEnter={e => { e.currentTarget.style.background = "#EEF1FF"; e.currentTarget.style.borderColor = "#818CF8"; }}
                   onPointerLeave={e => { e.currentTarget.style.background = st.bg; e.currentTarget.style.borderColor = st.brd; }}
                 >
                   {khtml
-                    ? <span dangerouslySetInnerHTML={{ __html: khtml }} style={{ color: st.fg, pointerEvents: "none", fontSize: 14, lineHeight: 1.3 }} />
+                    ? <span dangerouslySetInnerHTML={{ __html: khtml }} style={{ color: st.fg, pointerEvents: "none", fontSize: 13, lineHeight: 1.2 }} />
                     : <span style={{ fontFamily: btn.num ? "'SF Mono',monospace" : "inherit", pointerEvents: "none" }}>{btn.l || "?"}</span>
                   }
-                  {hasSub && <span style={{ position: "absolute", bottom: 3, right: 4, width: 5, height: 5, borderRadius: "50%", background: "#EF4444", boxShadow: "0 0 0 1px white" }} />}
+                  {hasSub && <span style={{ position: "absolute", bottom: 2, right: 3, width: 4, height: 4, borderRadius: "50%", background: "#EF4444", boxShadow: "0 0 0 1px white" }} />}
                 </button>
               );
             })}
           </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* ── HOLD POPUP ── */}
@@ -2185,7 +2808,7 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
             const kh = ks(it.lt);
             return (
               <button key={ii}
-                onClick={() => { if (it.struct) insertStructure(it.struct); else if (it.c) insertChar(it.c); setPopup(null); }}
+                onClick={() => { if (it.struct) insertStructure(it.struct, it.fn); else if (it.c) insertChar(it.c); setPopup(null); }}
                 style={{ display: "block", width: "100%", padding: "10px 14px", background: "transparent", border: "none", color: "#1E293B", fontSize: 16, cursor: "pointer", textAlign: "left", borderRadius: 10, fontWeight: 600 }}
                 onMouseEnter={e => e.currentTarget.style.background = "#EEF1FF"}
                 onMouseLeave={e => e.currentTarget.style.background = "transparent"}
@@ -2287,7 +2910,7 @@ function RegisterPage({ onDone, onLogin }) {
     <AuthLayout>
       <div style={{textAlign:"center",marginBottom:24}}><div style={{fontSize:52}}>📝</div><h1 style={{margin:"8px 0 0",fontSize:22,fontWeight:800}}>Ro'yxatdan O'tish</h1></div>
       {err&&<div style={S.err}>{err}</div>}
-      {[["firstName","Ism"],["lastName","Familiya"],["group","Guruh/Sinf (10-A)"],["phone","Telefon raqam (login)"]].map(([k,ph])=>(
+      {[["firstName","Ism"],["lastName","Familiya"],["group","Guruh"],["phone","Telefon raqam (login)"]].map(([k,ph])=>(
         <div key={k}><label style={S.label}>{ph}</label><input value={f[k]} onChange={e=>setF({...f,[k]:e.target.value})} style={S.input} placeholder={ph}/></div>
       ))}
       <label style={S.label}>Parol</label>
@@ -2320,26 +2943,60 @@ function TestCreator({ existing, onSave, onCancel }) {
   const [accessCode,setAccessCode]=useState(existing?.accessCode||"");
   const [codePrice,setCodePrice]=useState(existing?.codePrice||"");
   const [pdfFile,setPdfFile]=useState(null);
-  const [pdfUrl,setPdfUrl]=useState(existing?.pdfUrl||null);
   const [sections,setSections]=useState(existing?.sections||[{name:"Fan 1",count:10,type:"closed4"}]);
   const [questions,setQuestions]=useState(existing?.questions||[]);
   const [step,setStep]=useState(existing?2:1);
   const [err,setErr]=useState("");
   const [kbdOpen,setKbdOpen]=useState(null); // {qIdx, sub}
+  const [restrictGroups,setRestrictGroups]=useState(!!(existing?.targetGroups && existing.targetGroups.length>0));
+  const [targetGroups,setTargetGroups]=useState(existing?.targetGroups || []); // [] = barcha guruhlarga ko'rinadi
+  const [customGroupInput,setCustomGroupInput]=useState("");
+  const allGroups = useMemo(() => {
+    const users = db.get("users") || [];
+    const set = new Set(users.map(u=>u.group).filter(Boolean));
+    (existing?.targetGroups||[]).forEach(g=>set.add(g));
+    return [...set].sort();
+  }, []);
+  const toggleGroup = (g) => setTargetGroups(prev => prev.includes(g) ? prev.filter(x=>x!==g) : [...prev, g]);
+  const addCustomGroup = () => {
+    const g = customGroupInput.trim();
+    if (!g) return;
+    if (!targetGroups.includes(g)) setTargetGroups(prev=>[...prev, g]);
+    setCustomGroupInput("");
+  };
 
   const typeOpts=(t)=>({closed2:2,closed3:3,closed4:4,closed5:5,closed6:6,closed7:7,closed8:8,open:0})[t]||4;
   const typeLabel=(t)=>({closed2:"2 variant",closed3:"3 variant",closed4:"4 variant (A-D)",closed5:"5 variant (A-E)",closed6:"6 variant",closed7:"7 variant",closed8:"8 variant",open:"Ochiq (yozma)"})[t]||t;
   const totalQ=sections.reduce((s,sec)=>s+Number(sec.count),0);
 
   const [pdfLoading,setPdfLoading]=useState(false);
-  const [docType,setDocType]=useState(existing?.latexSource ? "latex" : "pdf"); // "pdf" | "latex"
-  const [latexSource,setLatexSource]=useState(existing?.latexSource || "");
-  const [latexFileName,setLatexFileName]=useState(existing?.latexFileName || "");
-  const [latexMode,setLatexMode]=useState(existing?.latexFileName ? "upload" : "write"); // "upload" | "write"
   const [showLatexPreview,setShowLatexPreview]=useState(true);
-  const [latexImages,setLatexImages]=useState(existing?.latexImages || {}); // {rasm1: dataURL, ...}
+  const [latexMode,setLatexMode]=useState(existing?.latexFileName ? "upload" : "write"); // "upload" | "write"
   const latexTextareaRef = useRef(null);
 
+  // ===== 3 tilli hujjatlar (UZ / QQ / RU): har bir test uchun PDF yoki LaTeX alohida-alohida yuklanadi =====
+  const [docLang,setDocLang]=useState("uz"); // hozir tahrirlanayotgan til
+  const [langDocs,setLangDocs]=useState(() => {
+    if (existing?.langDocs) return existing.langDocs;
+    // Eski (bir tilli) testlarni "uz" sifatida ko'chiramiz
+    const base = emptyLangDocs();
+    if (existing?.pdfUrl || existing?.latexSource) {
+      base.uz = { docType: existing?.latexSource ? "latex" : "pdf", pdfUrl: existing?.pdfUrl||null, latexSource: existing?.latexSource||"", latexFileName: existing?.latexFileName||"", latexImages: existing?.latexImages||{} };
+    }
+    return base;
+  });
+  const cur = langDocs[docLang] || emptyLangDoc();
+  const updateCur = (patch) => setLangDocs(p => ({ ...p, [docLang]: { ...(p[docLang]||emptyLangDoc()), ...patch } }));
+  const setDocType = (t) => updateCur({ docType: t });
+  const setPdfUrl = (v) => updateCur({ pdfUrl: v });
+  const setLatexSource = (v) => updateCur({ latexSource: v });
+  const setLatexFileName = (v) => updateCur({ latexFileName: v });
+  const setLatexImages = (fn) => updateCur({ latexImages: typeof fn==="function" ? fn(cur.latexImages||{}) : fn });
+  const docType = cur.docType || "pdf";
+  const pdfUrl = cur.pdfUrl || null;
+  const latexSource = cur.latexSource || "";
+  const latexFileName = cur.latexFileName || "";
+  const latexImages = cur.latexImages || {};
 
   const handlePdf=(e)=>{
     const file=e.target.files[0]; if(!file) return;
@@ -2388,7 +3045,8 @@ function TestCreator({ existing, onSave, onCancel }) {
       let n = Object.keys(latexImages).length + 1;
       let key = `rasm${n}`;
       while (latexImages[key]) { n++; key = `rasm${n}`; }
-      setLatexImages(p=>({...p,[key]:ev.target.result}));
+      const nextImages = {...latexImages,[key]:ev.target.result};
+      setLatexImages(nextImages);
       const cmd = `\\includegraphics{${key}}`;
       const ta = latexTextareaRef.current;
       if (ta) {
@@ -2398,7 +3056,7 @@ function TestCreator({ existing, onSave, onCancel }) {
         setLatexSource(next);
         requestAnimationFrame(()=>{ ta.focus(); ta.selectionStart=ta.selectionEnd=start+cmd.length; });
       } else {
-        setLatexSource(p=>p + (p?"\n":"") + cmd);
+        setLatexSource((latexSource?latexSource+"\n":"") + cmd);
       }
     };
     reader.onerror = () => alert("Rasmni o'qishda xatolik yuz berdi!");
@@ -2437,11 +3095,25 @@ function TestCreator({ existing, onSave, onCancel }) {
   const save=()=>{
     if(!name.trim()){setErr("Test nomini kiriting!");return;}
     if(requireCode && !accessCode.trim()){setErr("Kirish kodini kiriting yoki tasodifiy yarating!");return;}
+    if(restrictGroups && targetGroups.length===0){setErr("Kamida bitta guruhni tanlang yoki \"Barcha guruhlarga\" ni belgilang!");return;}
     const schedTs = localInputToTs(scheduledAt);
     const wasActive = existing?.active||false;
     // Agar rejalashtirilgan vaqt kelajakda bo'lsa va test hali qo'lda faollashtirilmagan bo'lsa, uni nofaol holatda saqlaymiz — vaqt kelganda avtomatik faollashadi.
     const willAutoStart = schedTs && schedTs > Date.now() && !wasActive;
-    onSave({id:existing?.id||Date.now(),name,duration,closedCount:questions.filter(q=>q.type==="closed").length,optionsCount:sections[0]?typeOpts(sections[0].type):4,sections,questions,active:willAutoStart?false:wasActive,scheduledAt:schedTs,showAnswersAfter:showAnswers,showStats,startedAt:existing?.startedAt||null,pdfUrl:docType==="pdf"?pdfUrl:null,latexSource:docType==="latex"?latexSource:null,latexFileName:docType==="latex"?latexFileName:null,latexImages:docType==="latex"?latexImages:null,accessCode:requireCode?accessCode.trim().toUpperCase():null,codePrice:requireCode?codePrice:null});
+    // Har bir til uchun bo'sh bo'lmagan qismini saqlaymiz (docType bo'yicha tozalab)
+    const cleanLangDocs = {};
+    DOC_LANGS.forEach(l=>{
+      const d = langDocs[l.code] || emptyLangDoc();
+      cleanLangDocs[l.code] = {
+        docType: d.docType||"pdf",
+        pdfUrl: d.docType==="pdf" ? (d.pdfUrl||null) : null,
+        latexSource: d.docType==="latex" ? (d.latexSource||null) : null,
+        latexFileName: d.docType==="latex" ? (d.latexFileName||null) : null,
+        latexImages: d.docType==="latex" ? (d.latexImages||null) : null,
+      };
+    });
+    const uzDoc = cleanLangDocs.uz;
+    onSave({id:existing?.id||Date.now(),name,duration,closedCount:questions.filter(q=>q.type==="closed").length,optionsCount:sections[0]?typeOpts(sections[0].type):4,sections,questions,active:willAutoStart?false:wasActive,scheduledAt:schedTs,showAnswersAfter:showAnswers,showStats,startedAt:existing?.startedAt||null,langDocs:cleanLangDocs,pdfUrl:uzDoc.pdfUrl,latexSource:uzDoc.latexSource,latexFileName:uzDoc.latexFileName,latexImages:uzDoc.latexImages,accessCode:requireCode?accessCode.trim().toUpperCase():null,codePrice:requireCode?codePrice:null,targetGroups:restrictGroups?targetGroups:[]});
   };
 
   const grouped=()=>{
@@ -2460,10 +3132,28 @@ function TestCreator({ existing, onSave, onCancel }) {
       {step===1&&(
         <div>
           <label style={S.label}>Test nomi</label>
-          <input value={name} onChange={e=>setName(e.target.value)} style={S.input} placeholder="Algebra imtihoni"/>
+          <input value={name} onChange={e=>setName(e.target.value)} style={S.input} placeholder="Test nomi"/>
 
-          {/* PDF / LaTeX upload */}
-          <label style={S.label}>📄 Test varianti (ixtiyoriy)</label>
+          {/* PDF / LaTeX upload — 3 tilda (UZ / QQ / RU) */}
+          <label style={S.label}>📄 Test varianti (ixtiyoriy) — har til uchun alohida</label>
+          <div style={{display:"flex",gap:8,marginBottom:10,background:"#F1F5F9",padding:5,borderRadius:11}}>
+            {DOC_LANGS.map(l=>{
+              const has = !!(cur && docLang===l.code ? (langDocs[l.code]?.pdfUrl||langDocs[l.code]?.latexSource) : (langDocs[l.code]?.pdfUrl||langDocs[l.code]?.latexSource));
+              return (
+                <button key={l.code} onClick={()=>setDocLang(l.code)} style={{
+                  flex:1,padding:"8px 4px",borderRadius:8,border:"none",cursor:"pointer",
+                  background:docLang===l.code?"white":"transparent",
+                  boxShadow:docLang===l.code?"0 1px 4px rgba(0,0,0,0.12)":"none",
+                  color:docLang===l.code?C.primary:C.textMid,fontWeight:800,fontSize:13,
+                  display:"flex",alignItems:"center",justifyContent:"center",gap:5,position:"relative"
+                }}>
+                  <span><LangFlag lang={l} size={17}/></span><span>{l.label}</span>
+                  {has && <span style={{position:"absolute",top:2,right:6,width:7,height:7,borderRadius:"50%",background:C.successDark}}/>}
+                </button>
+              );
+            })}
+          </div>
+          <p style={{margin:"-6px 0 10px",fontSize:11.5,color:C.textLight}}>Hozir tahrirlanmoqda: <b>{DOC_LANGS.find(l=>l.code===docLang)?.full}</b>. Yashil nuqta — shu tilda hujjat yuklangan.</p>
           <div style={{display:"flex",gap:8,marginBottom:10}}>
             <button onClick={()=>setDocType("pdf")} style={{
               flex:1,padding:"9px",borderRadius:9,border:`1.5px solid ${docType==="pdf"?C.primary:C.border}`,
@@ -2593,7 +3283,7 @@ function TestCreator({ existing, onSave, onCancel }) {
           )}
 
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:4}}>
-            <div><label style={S.label}>⏱ Vaqt (daqiqa)</label><input type="number" value={duration} onChange={e=>setDuration(+e.target.value)} style={S.input} min={1}/></div>
+            <div><label style={S.label}>⏱ Vaqt (daqiqa)</label><input type="number" value={duration} onChange={e=>{const v=e.target.value; setDuration(v===""?"":+v);}} onBlur={e=>{if(e.target.value===""||+e.target.value<1) setDuration(1);}} style={S.input} min={1}/></div>
             <div><label style={S.label}>👁 Natijalar</label>
               <select value={showAnswers} onChange={e=>setShowAnswers(e.target.value)} style={S.input}>
                 <option value="immediate">Darhol</option><option value="manual">Qo'lda</option>
@@ -2623,12 +3313,12 @@ function TestCreator({ existing, onSave, onCancel }) {
             </div>
           </label>
 
-          {/* Pullik test / Kirish kodi */}
+          {/* Maxfiy test / Kirish kodi */}
           <div style={{background:"#FFFBEB",border:"1.5px solid #FDE68A",borderRadius:12,padding:14,marginBottom:16}}>
             <label style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",marginBottom:requireCode?12:0}}>
               <input type="checkbox" checked={requireCode} onChange={e=>setRequireCode(e.target.checked)}
                 style={{width:20,height:20,accentColor:"#F59E0B",cursor:"pointer"}}/>
-              <span style={{fontWeight:700,color:"#92400E",fontSize:14}}>🔒 Pullik test (kirish kodi talab qilinsin)</span>
+              <span style={{fontWeight:700,color:"#92400E",fontSize:14}}>🔒 Maxfiy test (kirish kodi talab qilinsin)</span>
             </label>
             {requireCode && (
               <div style={{display:"grid",gridTemplateColumns:"2fr 1fr",gap:10}}>
@@ -2658,6 +3348,42 @@ function TestCreator({ existing, onSave, onCancel }) {
             )}
           </div>
 
+          {/* Qaysi guruhlarga ko'rinishi */}
+          <div style={{background:"#EEF1FF",border:`1.5px solid ${C.border}`,borderRadius:12,padding:14,marginBottom:16}}>
+            <label style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",marginBottom:restrictGroups?12:0}}>
+              <input type="checkbox" checked={restrictGroups} onChange={e=>setRestrictGroups(e.target.checked)}
+                style={{width:20,height:20,accentColor:C.primary,cursor:"pointer"}}/>
+              <span style={{fontWeight:700,color:C.primary,fontSize:14}}>👥 Faqat tanlangan guruhlarga ko'rinsin</span>
+            </label>
+            {!restrictGroups && (
+              <p style={{margin:0,fontSize:12,color:C.textMid}}>Hozircha barcha guruhlarga ko'rinadi.</p>
+            )}
+            {restrictGroups && (
+              <div>
+                {allGroups.length>0 && (
+                  <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:10}}>
+                    {allGroups.map(g=>(
+                      <button key={g} onClick={()=>toggleGroup(g)} style={{
+                        padding:"6px 14px",borderRadius:20,border:`1.5px solid ${targetGroups.includes(g)?C.primary:C.border}`,
+                        background:targetGroups.includes(g)?C.primary:"white",color:targetGroups.includes(g)?"white":C.text,
+                        fontWeight:600,fontSize:13,cursor:"pointer"
+                      }}>{targetGroups.includes(g)?"✓ ":""}{g}</button>
+                    ))}
+                  </div>
+                )}
+                <div style={{display:"flex",gap:8}}>
+                  <input value={customGroupInput} onChange={e=>setCustomGroupInput(e.target.value)}
+                    onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addCustomGroup();}}}
+                    style={{...S.input,margin:0}} placeholder="Yangi guruh nomi (masalan 10-A)"/>
+                  <button onClick={addCustomGroup} style={{...S.btnSmall,background:C.primary,whiteSpace:"nowrap"}}>+ Qo'shish</button>
+                </div>
+                {targetGroups.length>0 && (
+                  <p style={{margin:"8px 0 0",fontSize:12,color:C.textMid}}>Tanlangan: <b>{targetGroups.join(", ")}</b></p>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Sections */}
           <div style={{background:"#F8F9FF",borderRadius:12,padding:14,marginBottom:16,border:`1px solid ${C.border}`}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
@@ -2679,9 +3405,9 @@ function TestCreator({ existing, onSave, onCancel }) {
                 <div style={{width:26,height:26,borderRadius:"50%",background:C.primaryLight,color:C.primary,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:800}}>{i+1}</div>
                 <input value={sec.name} onChange={e=>setSections(p=>p.map((s,idx)=>idx===i?{...s,name:e.target.value}:s))} style={{...S.input,margin:0,padding:"9px 10px",fontSize:13}} placeholder={"Fan "+(i+1)}/>
                 <div style={{display:"flex",alignItems:"center",background:C.card,borderRadius:8,border:`1.5px solid ${C.border}`,overflow:"hidden",height:38}}>
-                  <button onClick={()=>setSections(p=>p.map((s,idx)=>idx===i?{...s,count:Math.max(1,s.count-1)}:s))} style={{width:30,height:"100%",background:C.danger,border:"none",color:"white",fontSize:18,cursor:"pointer",fontWeight:900}}>−</button>
-                  <input type="number" value={sec.count} onChange={e=>setSections(p=>p.map((s,idx)=>idx===i?{...s,count:Math.max(1,+e.target.value)}:s))} style={{flex:1,background:"transparent",border:"none",color:C.text,fontWeight:800,fontSize:15,textAlign:"center",outline:"none",minWidth:0}} min={1}/>
-                  <button onClick={()=>setSections(p=>p.map((s,idx)=>idx===i?{...s,count:s.count+1}:s))} style={{width:30,height:"100%",background:C.primary,border:"none",color:"white",fontSize:18,cursor:"pointer",fontWeight:900}}>+</button>
+                  <button onClick={()=>setSections(p=>p.map((s,idx)=>idx===i?{...s,count:Math.max(1,Number(s.count||0)-1)}:s))} style={{width:30,height:"100%",background:C.danger,border:"none",color:"white",fontSize:18,cursor:"pointer",fontWeight:900}}>−</button>
+                  <input type="number" value={sec.count} onChange={e=>{const v=e.target.value; setSections(p=>p.map((s,idx)=>idx===i?{...s,count:v===""?"":+v}:s));}} onBlur={e=>{if(e.target.value===""||+e.target.value<1) setSections(p=>p.map((s,idx)=>idx===i?{...s,count:1}:s));}} style={{flex:1,background:"transparent",border:"none",color:C.text,fontWeight:800,fontSize:15,textAlign:"center",outline:"none",minWidth:0}} min={1}/>
+                  <button onClick={()=>setSections(p=>p.map((s,idx)=>idx===i?{...s,count:Number(s.count||0)+1}:s))} style={{width:30,height:"100%",background:C.primary,border:"none",color:"white",fontSize:18,cursor:"pointer",fontWeight:900}}>+</button>
                 </div>
                 <select value={sec.type} onChange={e=>setSections(p=>p.map((s,idx)=>idx===i?{...s,type:e.target.value}:s))} style={{...S.input,margin:0,padding:"9px 8px",fontSize:12}}>
                   {["closed2","closed3","closed4","closed5","closed6","closed7","closed8","open"].map(t=><option key={t} value={t}>{typeLabel(t)}</option>)}
@@ -2754,7 +3480,7 @@ function TestCreator({ existing, onSave, onCancel }) {
                         return (
                           <div>
                             <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:4}}>
-                              <div onClick={()=>setKbdOpen(isAct?null:{qIdx:i,sub:null})} style={{flex:1,minHeight:44,padding:"10px 14px",background:isAct?"#EEF1FF":"#F8F9FF",border:`2px solid ${isAct?C.primary:q.correctAnswer?C.success:C.border}`,borderRadius:10,cursor:"pointer",fontSize:17,display:"flex",alignItems:"center",boxShadow:isAct?"0 0 0 3px rgba(79,110,247,0.2)":"none"}}>
+                              <div onClick={e=>{setKbdOpen(isAct?null:{qIdx:i,sub:null});if(!isAct)setTimeout(()=>e.currentTarget.scrollIntoView({behavior:"smooth",block:"center"}),350);}} style={{flex:1,minHeight:44,padding:"10px 14px",background:isAct?"#EEF1FF":"#F8F9FF",border:`2px solid ${isAct?C.primary:q.correctAnswer?C.success:C.border}`,borderRadius:10,cursor:"pointer",fontSize:17,display:"flex",alignItems:"center",boxShadow:isAct?"0 0 0 3px rgba(79,110,247,0.2)":"none"}}>
                                 {q.correctAnswer?<span ref={el=>{if(el&&window.katex){try{window.katex.render(toLatex(q.correctAnswer),el,{throwOnError:false})}catch{}}}} style={{fontSize:18,fontFamily:"KaTeX_Main,serif",color:"#15803D"}}/>:<span style={{color:C.textLight,fontSize:13}}>Formulali javob uchun bosing...</span>}
                               </div>
                               <button onClick={()=>addSub(i)} style={{...S.btnSmall,background:"#E2E8F0",color:C.textMid,fontSize:12}}>+ Kichik band</button>
@@ -2873,6 +3599,149 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
   const [adminDocPreview,setAdminDocPreview]=useState(null); // {type:"pdf"|"latex", url?, source?, name}
   const [confirmModal,setConfirmModal]=useState(null);
   const [exportModal,setExportModal]=useState(null); // {dataUrl, filename, tsv, isBinary}
+  const [regradingId,setRegradingId]=useState(null); // hozir qayta baholanayotgan test id
+  const [regradeDoneMsg,setRegradeDoneMsg]=useState(null);
+  const [raschModal,setRaschModal]=useState(null); // {test, settings} — sozlamalarni tahrirlash oynasi
+  const [raschBusyId,setRaschBusyId]=useState(null);
+  const [raschDoneMsg,setRaschDoneMsg]=useState(null);
+  const [raschUploadTarget,setRaschUploadTarget]=useState(null); // qaysi test uchun fayl yuklanmoqda
+  const [raschUploading,setRaschUploading]=useState(false);
+  const raschFileInputRef=useRef(null);
+
+  // ===== Mustaqil "Excel -> Rash" kalkulyatori (saytda ro'yxatdan o'tgan bo'lish shart emas) =====
+  const [raschCalcRawRows,setRaschCalcRawRows]=useState(null); // fayldan o'qilgan xom qatorlar (o'zgarmaydi)
+  const [raschCalcRows,setRaschCalcRows]=useState(null); // hisoblangan (ko'rsatiladigan) qatorlar
+  const [raschCalcFileName,setRaschCalcFileName]=useState(null);
+  const [raschCalcBusy,setRaschCalcBusy]=useState(false);
+  const [raschCalcError,setRaschCalcError]=useState(null);
+  const [raschCalcSettings,setRaschCalcSettings]=useState({...DEFAULT_RASCH_SETTINGS});
+  const raschCalcFileInputRef=useRef(null);
+  const handleRaschCalcFile = (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setRaschCalcBusy(true); setRaschCalcError(null); setRaschCalcRows(null); setRaschCalcRawRows(null);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const wb = XLSX.read(ev.target.result, { type: "array" });
+        const { rows } = parseUploadedResultsSheet(wb);
+        if (!rows.length) {
+          setRaschCalcError("Faylda F.I.O / Ism ustuni topilmadi. Fayl tuzilishini tekshiring (birinchi ustun ism, keyingilari 1/0 javoblar bo'lishi kerak).");
+        } else {
+          const computed = computeRaschFromFileRows(rows, raschCalcSettings);
+          if (!computed.length) {
+            setRaschCalcError("Hech qanday qator hisoblanmadi — BALL ustuni yoki To'g'ri/Jami savol (yoki 1/0 javoblar) ustunlari topilmadi.");
+          } else {
+            setRaschCalcRawRows(rows);
+            setRaschCalcRows(computed);
+            setRaschCalcFileName(file.name);
+          }
+        }
+      } catch (err) {
+        setRaschCalcError("Faylni o'qib bo'lmadi. .xlsx formatida ekanligini tekshiring.");
+      }
+      setRaschCalcBusy(false);
+    };
+    reader.onerror = () => { setRaschCalcBusy(false); setRaschCalcError("Faylni o'qishda xatolik yuz berdi."); };
+    reader.readAsArrayBuffer(file);
+  };
+  const recalcRaschCalc = () => {
+    if (!raschCalcRawRows) return;
+    setRaschCalcRows(computeRaschFromFileRows(raschCalcRawRows, raschCalcSettings));
+  };
+  // Yuklangan faylni (yuqoridagi kalkulyatorda hisoblangan) TANLANGAN bitta testga bog'lab,
+  // shu testni saytda topshirganlar bilan birga (bitta Rash hisobida) profillarga saqlaydi.
+  const [raschCalcAttachTestId,setRaschCalcAttachTestId]=useState("");
+  const [raschCalcAttaching,setRaschCalcAttaching]=useState(false);
+  const attachRaschCalcToTest = () => {
+    if (!raschCalcRawRows || !raschCalcAttachTestId) return;
+    const test = tests.find(t=>t.id===Number(raschCalcAttachTestId) || t.id===raschCalcAttachTestId);
+    if (!test) return;
+    setRaschCalcAttaching(true);
+    setTimeout(() => {
+      const settings = raschCalcSettings;
+      const r = importRaschFromRows(test, raschCalcRawRows, settings);
+      db.set("tests",(db.get("tests")||[]).map(t=>t.id===test.id?{...t,raschSettings:settings,raschCalculatedAt:r.calculatedAt}:t));
+      reload();
+      let msg = `💾 "${test.name}" — saytda topshirganlar va bu fayl birgalikda hisoblanib, ${r.matched} ta o'quvchi profiliga yozildi.`;
+      if (r.fileOnly.length) msg += ` ${r.fileOnly.length} ta o'quvchi saytda topilmadi (yuqoridagi jadval endi ular bilan yangilandi).`;
+      setRaschDoneMsg(msg);
+      setRaschCalcAttaching(false);
+      setTimeout(()=>setRaschDoneMsg(null), 8000);
+    }, 30);
+  };
+
+  const triggerRaschUpload = (test) => { setRaschUploadTarget(test); requestAnimationFrame(()=>raschFileInputRef.current?.click()); };
+  const handleRaschFile = (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file || !raschUploadTarget) return;
+    const test = raschUploadTarget;
+    setRaschUploading(true);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const wb = XLSX.read(ev.target.result, { type: "array" });
+        const { rows } = parseUploadedResultsSheet(wb);
+        if (!rows.length) {
+          setRaschDoneMsg("⚠️ Faylda F.I.O / Ism ustuni topilmadi. Fayl tuzilishini tekshiring.");
+        } else {
+          const settings = test.raschSettings || DEFAULT_RASCH_SETTINGS;
+          const r = importRaschFromRows(test, rows, settings);
+          db.set("tests",(db.get("tests")||[]).map(t=>t.id===test.id?{...t,raschSettings:settings,raschCalculatedAt:r.calculatedAt}:t));
+          reload();
+          let msg = `📤 "${test.name}" — saytda topshirganlar VA fayldagilar birgalikda, bitta Rash hisobida qayta ishlandi. ${r.matched} ta o'quvchi profiliga yozildi.`;
+          if (r.fileOnly.length) { msg += ` ${r.fileOnly.length} ta faylda bor, lekin saytda ro'yxatdan o'tmagan/topilmadi — natijalari "🎯 Rash (Excel)" bo'limida ko'rish/yuklab olish uchun tayyor.`; setRaschCalcRows(r.fileOnly); setRaschCalcRawRows(r.fileOnly); setRaschCalcFileName(`${test.name} — saytda topilmagan o'quvchilar`); }
+          if (r.unusable.length) msg += ` ${r.unusable.length} ta qator hisoblab bo'lmadi (javob/ball yo'q).`;
+          setRaschDoneMsg(msg);
+        }
+      } catch (err) {
+        setRaschDoneMsg("❌ Faylni o'qib bo'lmadi. .xlsx formatida ekanligini tekshiring.");
+      }
+      setRaschUploading(false);
+      setRaschUploadTarget(null);
+      setTimeout(()=>setRaschDoneMsg(null), 7000);
+    };
+    reader.onerror = () => { setRaschUploading(false); setRaschUploadTarget(null); setRaschDoneMsg("❌ Faylni o'qishda xatolik yuz berdi."); setTimeout(()=>setRaschDoneMsg(null),5000); };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const openRaschModal = (test) => {
+    setRaschModal({ test, settings: { ...(test.raschSettings || DEFAULT_RASCH_SETTINGS) } });
+  };
+  const runRasch = () => {
+    const { test, settings } = raschModal;
+    setRaschBusyId(test.id);
+    setTimeout(() => { // UI qotib qolmasligi uchun keyingi tikda hisoblaymiz
+      const r = computeRaschForTest(test, settings);
+      if (r.count > 0) {
+        db.set("tests", (db.get("tests")||[]).map(t=>t.id===test.id?{...t,raschSettings:settings,raschCalculatedAt:r.calculatedAt,raschMean:r.mean,raschStd:r.std}:t));
+      }
+      setRaschBusyId(null);
+      setRaschModal(null);
+      reload();
+      setRaschDoneMsg(r.count>0?`🎯 "${test.name}" — ${r.count} ta o'quvchi natijasi Rash modeli bo'yicha hisoblandi.`:`"${test.name}" bo'yicha hali hech kim test topshirmagan.`);
+      setTimeout(()=>setRaschDoneMsg(null), 4500);
+    }, 30);
+  };
+
+  const handleRegrade = (test) => {
+    setConfirmModal({
+      message: `"${test.name}" testi bo'yicha barcha topshirilgan javoblar joriy (yangilangan) to'g'ri javob kaliti bilan qayta tekshiriladi. Davom etilsinmi?`,
+      confirmLabel: "Qayta baholash",
+      danger: false,
+      onConfirm: async () => {
+        setConfirmModal(null);
+        setRegradingId(test.id);
+        const count = await regradeTestResults(test);
+        setRegradingId(null);
+        reload();
+        setRegradeDoneMsg(`✅ "${test.name}" — ${count} ta natija qayta baholandi.`);
+        setTimeout(()=>setRegradeDoneMsg(null), 4000);
+      },
+    });
+  };
 
   const reload=()=>{setTests(db.get("tests")||[]);setUsers(db.get("users")||[]);setResults(db.get("results")||[]);};
   useEffect(reload,[tab]);
@@ -2906,7 +3775,46 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
 
   return (
     <div style={S.page}>
-      {confirmModal && <ConfirmModal message={confirmModal.message} onConfirm={confirmModal.onConfirm} onCancel={()=>setConfirmModal(null)}/>}
+      {confirmModal && <ConfirmModal message={confirmModal.message} confirmLabel={confirmModal.confirmLabel} danger={confirmModal.danger} onConfirm={confirmModal.onConfirm} onCancel={()=>setConfirmModal(null)}/>}
+      <input ref={raschFileInputRef} type="file" accept=".xlsx,.xls" onChange={handleRaschFile} style={{display:"none"}}/>
+      <input ref={raschCalcFileInputRef} type="file" accept=".xlsx,.xls" onChange={handleRaschCalcFile} style={{display:"none"}}/>
+      {regradeDoneMsg && (
+        <div style={{position:"fixed",top:16,left:"50%",transform:"translateX(-50%)",zIndex:99999,background:C.successDark,color:"white",padding:"12px 20px",borderRadius:12,fontWeight:700,fontSize:13,boxShadow:"0 6px 20px rgba(0,0,0,0.2)",maxWidth:"90%",textAlign:"center"}}>{regradeDoneMsg}</div>
+      )}
+      {raschDoneMsg && (
+        <div style={{position:"fixed",top:16,left:"50%",transform:"translateX(-50%)",zIndex:99999,background:"#6D28D9",color:"white",padding:"14px 20px",borderRadius:12,fontWeight:700,fontSize:12.5,boxShadow:"0 6px 20px rgba(0,0,0,0.2)",maxWidth:"92%",maxHeight:"70vh",overflowY:"auto",textAlign:"left",whiteSpace:"pre-line",lineHeight:1.6}}>{raschDoneMsg}</div>
+      )}
+      {raschModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.5)", zIndex: 99999, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={()=>setRaschModal(null)}>
+          <div style={{ background: "white", borderRadius: 16, padding: 22, maxWidth: 420, width: "100%", maxHeight:"88vh", overflowY:"auto", boxShadow: "0 10px 40px rgba(0,0,0,0.25)" }} onClick={e=>e.stopPropagation()}>
+            <p style={{ margin: "0 0 4px", fontSize: 16, fontWeight: 800, color: C.text }}>🎯 Rash modeli bo'yicha hisoblash</p>
+            <p style={{ margin: "0 0 16px", fontSize: 12.5, color: C.textMid, lineHeight: 1.5 }}>"<b>{raschModal.test.name}</b>" testini topshirgan barcha o'quvchilarning natijasi Rash (logistik) modeli asosida qayta baholanadi. Sozlamalarni xohlasangiz o'zgartiring (standart qiymatlar — shablon Excel bilan bir xil).</p>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+              {[
+                ["maxScore","Maksimal ball (chegara)"],
+                ["center","Markaz (o'rtacha) ball"],
+                ["ncMax","NC chegarasi (bundan past)"],
+                ["cMax","C chegarasi"],
+                ["cPlusMax","C+ chegarasi"],
+                ["bMax","B chegarasi"],
+                ["bPlusMax","B+ chegarasi"],
+                ["aMax","A chegarasi (yuqorisi A+)"],
+              ].map(([key,label])=>(
+                <label key={key} style={{fontSize:11.5,color:C.textMid,fontWeight:600}}>{label}
+                  <input type="number" step="0.1" value={raschModal.settings[key]}
+                    onChange={e=>setRaschModal(p=>({...p,settings:{...p.settings,[key]:e.target.value===""?"":Number(e.target.value)}}))}
+                    style={{...S.input,marginTop:4,padding:"7px 9px",fontSize:13}}/>
+                </label>
+              ))}
+            </div>
+            <p style={{margin:"0 0 14px",fontSize:11,color:C.textLight}}>Topshirgan o'quvchilar soni: <b>{results.filter(r=>r.testId===raschModal.test.id).length}</b></p>
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={()=>setRaschModal(null)} style={{flex:1,padding:"11px",borderRadius:10,border:`1.5px solid ${C.border}`,background:"white",fontWeight:700,fontSize:13,cursor:"pointer",color:C.textMid}}>Bekor qilish</button>
+              <button onClick={runRasch} style={{flex:1,padding:"11px",borderRadius:10,border:"none",background:"#6D28D9",color:"white",fontWeight:800,fontSize:13,cursor:"pointer"}}>🎯 Hisoblash</button>
+            </div>
+          </div>
+        </div>
+      )}
       {exportModal && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.5)", zIndex: 99999, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={()=>setExportModal(null)}>
           <div style={{ background: "white", borderRadius: 16, padding: 22, maxWidth: 360, width: "100%", boxShadow: "0 10px 40px rgba(0,0,0,0.25)" }} onClick={e=>e.stopPropagation()}>
@@ -2940,7 +3848,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
       )}
 
       <div style={{background:C.card,borderBottom:`1px solid ${C.border}`,display:"flex",padding:"0 16px"}}>
-        {[["tests","📋 Testlar"],["users","👥 O'quvchilar"],["results","📊 Natijalar"]].map(([t,l])=>(
+        {[["tests","📋 Testlar"],["users","👥 O'quvchilar"],["results","📊 Natijalar"],["raschcalc","🎯 Rash (Excel)"]].map(([t,l])=>(
           <button key={t} onClick={()=>{setTab(t);setCreating(false);setEditing(null);}} style={{padding:"14px 18px",background:"none",border:"none",cursor:"pointer",color:tab===t?C.primary:C.textMid,fontWeight:tab===t?800:500,borderBottom:tab===t?`3px solid ${C.primary}`:"3px solid transparent",fontSize:14}}>{l}</button>
         ))}
       </div>
@@ -2967,15 +3875,24 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                         <span style={{...S.badge,background:C.primaryLight,color:C.primary}}>{tr.length} topshirdi</span>
                         {test.active&&endAt&&<span style={{...S.badge,background:C.warningLight,color:C.warning}}>⏱ {endAt} da tugaydi</span>}
                         {!test.active&&test.scheduledAt&&<span style={{...S.badge,background:"#EEF1FF",color:C.primary}}>📅 {formatScheduled(test.scheduledAt)} da boshlanadi</span>}
-                        {test.pdfUrl&&<button onClick={()=>setAdminDocPreview({type:"pdf",url:test.pdfUrl,name:test.name})} style={{...S.badge,background:"#FEF3C7",color:"#92400E",border:"none",cursor:"pointer"}}>📄 PDF</button>}
-                        {test.latexSource&&<button onClick={()=>setAdminDocPreview({type:"latex",source:test.latexSource,name:test.name,id:test.id,images:test.latexImages})} style={{...S.badge,background:"#EEF1FF",color:C.primary,border:"none",cursor:"pointer"}}>∑ LaTeX</button>}
+                        {availableDocLangs(test).map(l=>{
+                          const d=getLangDoc(test,l.code);
+                          return d.pdfUrl
+                            ? <button key={l.code} onClick={()=>setAdminDocPreview({type:"pdf",url:d.pdfUrl,name:`${test.name} — ${l.full}`})} style={{...S.badge,background:"#FEF3C7",color:"#92400E",border:"none",cursor:"pointer",display:"inline-flex",alignItems:"center",gap:4}}><LangFlag lang={l} size={13}/> 📄 {l.label}</button>
+                            : <button key={l.code} onClick={()=>setAdminDocPreview({type:"latex",source:d.latexSource,name:`${test.name} — ${l.full}`,id:test.id+"_"+l.code,images:d.latexImages})} style={{...S.badge,background:"#EEF1FF",color:C.primary,border:"none",cursor:"pointer",display:"inline-flex",alignItems:"center",gap:4}}><LangFlag lang={l} size={13}/> ∑ {l.label}</button>;
+                        })}
                         {test.accessCode&&<span style={{...S.badge,background:"#FEF3C7",color:"#92400E"}}>🔒 Kod: {test.accessCode}{test.codePrice?` (${test.codePrice} so'm)`:""}</span>}
+                        {test.targetGroups&&test.targetGroups.length>0&&<span style={{...S.badge,background:C.primaryLight,color:C.primary}}>👥 {test.targetGroups.join(", ")}</span>}
+                        {test.raschCalculatedAt&&<span style={{...S.badge,background:"#EDE9FE",color:"#6D28D9"}}>🎯 Rash hisoblangan ({new Date(test.raschCalculatedAt).toLocaleDateString("uz-UZ")})</span>}
                       </div>
                     </div>
                     <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
                       <button onClick={()=>toggleActive(test.id)} style={{...S.btnSmall,background:test.active?C.danger:C.success}}>{test.active?"⛔ To'xtatish":"✅ Faollashtirish"}</button>
                       <button onClick={()=>{setEditing(test);setCreating(false);}} style={{...S.btnSmall,background:C.primary}}>✏️ Tahrirlash</button>
+                      <button onClick={()=>handleRegrade(test)} disabled={regradingId===test.id} style={{...S.btnSmall,background:regradingId===test.id?"#94A3B8":"#7C3AED"}}>{regradingId===test.id?"⏳ Baholanmoqda...":"🔄 Qayta baholash"}</button>
+                      <button onClick={()=>openRaschModal(test)} disabled={tr.length===0||raschBusyId===test.id} style={{...S.btnSmall,background:tr.length===0?"#CBD5E1":"#6D28D9",opacity:raschBusyId===test.id?0.6:1}}>{raschBusyId===test.id?"⏳ Hisoblanmoqda...":"🎯 Rash modeli"}</button>
                       <button onClick={()=>setExportModal(buildExcelExport(test,results,users))} style={{...S.btnSmall,background:C.successDark}}>📥 Excel</button>
+                      <button onClick={()=>triggerRaschUpload(test)} disabled={raschUploading} style={{...S.btnSmall,background:"#0891B2",opacity:raschUploading?0.6:1}}>{raschUploading&&raschUploadTarget?.id===test.id?"⏳ Yuklanmoqda...":"📤 Natija yuklash"}</button>
                       <button onClick={()=>deleteTest(test.id)} style={{...S.btnSmall,background:C.danger}}>🗑️</button>
                     </div>
                   </div>
@@ -3033,7 +3950,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
               }, 0);
               return (
                 <div style={{...S.card,padding:16,marginBottom:16,background:"linear-gradient(135deg,#FEF3C7,#FFFBEB)",border:"1.5px solid #FDE68A"}}>
-                  <p style={{margin:"0 0 4px",color:"#92400E",fontSize:13,fontWeight:700}}>💰 Pullik testlardan tushum (taxminiy)</p>
+                  <p style={{margin:"0 0 4px",color:"#92400E",fontSize:13,fontWeight:700}}>💰 Maxfiy testlardan tushum (taxminiy)</p>
                   <p style={{margin:0,color:"#92400E",fontSize:28,fontWeight:900}}>{totalRevenue.toLocaleString()} so'm</p>
                 </div>
               );
@@ -3043,16 +3960,22 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
               if(!tr.length) return null;
               return (
                 <div key={test.id} style={{marginBottom:24}}>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
                     <h4 style={{margin:0,color:C.primary}}>{test.name}</h4>
-                    <button onClick={()=>setExportModal(buildExcelExport(test,results,users))} style={{...S.btnSmall,background:C.successDark}}>📥 Excel</button>
+                    <div style={{display:"flex",gap:8}}>
+                      <button onClick={()=>openRaschModal(test)} disabled={raschBusyId===test.id} style={{...S.btnSmall,background:"#6D28D9",opacity:raschBusyId===test.id?0.6:1}}>{raschBusyId===test.id?"⏳...":"🎯 Rash modeli"}</button>
+                      <button onClick={()=>setExportModal(buildExcelExport(test,results,users))} style={{...S.btnSmall,background:C.successDark}}>📥 Excel</button>
+                      <button onClick={()=>triggerRaschUpload(test)} disabled={raschUploading} style={{...S.btnSmall,background:"#0891B2",opacity:raschUploading?0.6:1}}>{raschUploading&&raschUploadTarget?.id===test.id?"⏳...":"📤 Natija yuklash"}</button>
+                    </div>
                   </div>
                   <div style={{overflowX:"auto"}}>
                     <table style={S.table}>
-                      <thead><tr>{["#","F.I.O","Guruh","Ball","Foiz","Vaqt","Sana"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                      <thead><tr>{["#","F.I.O","Guruh","Ball","Foiz","Rash ball","Daraja","Vaqt","Sana"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
                       <tbody>{tr.sort((a,b)=>b.totalScore-a.totalScore).map((r,i)=>{
                         const u=users.find(u=>u.phone===r.userPhone);
                         const pct=Math.round((r.totalScore/test.questions.length)*100);
+                        const dGrade=r.rasch?.daraja;
+                        const dColor=dGrade==="NC"?C.danger:dGrade==="C"||dGrade==="C+"?C.warning:C.successDark;
                         return (
                           <tr key={r.id} style={{background:i%2===0?C.card:"#FAFBFF"}}>
                             <td style={S.td}>{i+1}</td>
@@ -3060,6 +3983,8 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                             <td style={S.td}>{u?.group||"-"}</td>
                             <td style={S.td}><b style={{color:pct>=70?C.successDark:pct>=50?C.warning:C.danger}}>{r.totalScore}</b>/{test.questions.length}</td>
                             <td style={S.td}><span style={{color:pct>=70?C.successDark:pct>=50?C.warning:C.danger,fontWeight:700}}>{pct}%</span></td>
+                            <td style={S.td}>{r.rasch?<b style={{color:"#6D28D9"}}>{r.rasch.ball.toFixed(1)}</b>:<span style={{color:C.textLight}}>—</span>}</td>
+                            <td style={S.td}>{dGrade?<span style={{...S.badge,background:dColor+"22",color:dColor,fontWeight:800}}>{dGrade}</span>:<span style={{color:C.textLight}}>—</span>}</td>
                             <td style={S.td}>{r.timeTaken?`${r.timeTaken} daq`:"-"}</td>
                             <td style={S.td}>{new Date(r.id).toLocaleDateString("uz-UZ")}</td>
                           </tr>
@@ -3071,6 +3996,74 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
               );
             })}
             {results.length===0&&<div style={S.empty}>Hali natijalar yo'q</div>}
+          </div>
+        )}
+
+        {tab==="raschcalc"&&(
+          <div>
+            <h3 style={{margin:"0 0 6px"}}>🎯 Rash modeli — Excel fayldan hisoblash</h3>
+            <p style={{margin:"0 0 18px",color:C.textMid,fontSize:13,lineHeight:1.5}}>Excel faylni yuklang — birinchi ustun F.I.O (yoki Ism), keyingi ustunlar har bir savol uchun 1/0 javoblar (yoki tayyor "BALL"/"Daraja" ustunlari) bo'lishi kifoya. Natija shu yerda ko'rinadi va Excel qilib yuklab olinadi. Xohlasangiz, pastda testlardan birini tanlab, natijani o'sha TEST bilan bog'lab (shu testni saytda topshirganlar bilan birgalikda hisoblab) o'quvchilar profiliga ham saqlashingiz mumkin — har bir test alohida-alohida, o'zining natijasi bilan hisoblanadi.</p>
+
+            <div style={{...S.card,padding:16,marginBottom:16}}>
+              <p style={{margin:"0 0 10px",fontWeight:800,fontSize:13}}>⚙️ Sozlamalar</p>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))",gap:10,marginBottom:14}}>
+                {[
+                  ["maxScore","Maksimal ball"],["center","Markaz ball"],["ncMax","NC chegarasi"],["cMax","C chegarasi"],
+                  ["cPlusMax","C+ chegarasi"],["bMax","B chegarasi"],["bPlusMax","B+ chegarasi"],["aMax","A chegarasi"],
+                ].map(([key,label])=>(
+                  <label key={key} style={{fontSize:11,color:C.textMid,fontWeight:600}}>{label}
+                    <input type="number" step="0.1" value={raschCalcSettings[key]}
+                      onChange={e=>setRaschCalcSettings(p=>({...p,[key]:e.target.value===""?"":Number(e.target.value)}))}
+                      style={{...S.input,marginTop:4,padding:"7px 9px",fontSize:13,marginBottom:0}}/>
+                  </label>
+                ))}
+              </div>
+              <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                <button onClick={()=>raschCalcFileInputRef.current?.click()} disabled={raschCalcBusy} style={{...S.btnSmall,background:"#6D28D9",padding:"11px 20px",fontSize:13,opacity:raschCalcBusy?0.6:1}}>{raschCalcBusy?"⏳ Hisoblanmoqda...":"📤 Excel faylni yuklash"}</button>
+                {raschCalcRawRows&&<button onClick={recalcRaschCalc} style={{...S.btnSmall,background:C.primary,padding:"11px 20px",fontSize:13}}>🔄 Sozlamalar bilan qayta hisoblash</button>}
+                {raschCalcRows&&raschCalcRows.length>0&&<button onClick={()=>{const ex=buildRaschCalcExport(raschCalcRows,raschCalcSettings); if(ex) setExportModal(ex);}} style={{...S.btnSmall,background:C.successDark,padding:"11px 20px",fontSize:13}}>📥 Natijani Excel qilib olish</button>}
+              </div>
+              {raschCalcFileName&&<p style={{margin:"10px 0 0",fontSize:12,color:C.textLight}}>Fayl: <b>{raschCalcFileName}</b> • {raschCalcRawRows?.length||0} qator o'qildi</p>}
+              {raschCalcError&&<p style={{margin:"10px 0 0",fontSize:12.5,color:C.danger,fontWeight:600}}>⚠️ {raschCalcError}</p>}
+            </div>
+
+            {raschCalcRawRows&&raschCalcRawRows.length>0&&(
+              <div style={{...S.card,padding:16,marginBottom:16,background:"#F5F3FF",border:"1.5px solid #DDD6FE"}}>
+                <p style={{margin:"0 0 10px",fontWeight:800,fontSize:13,color:"#6D28D9"}}>💾 Bu natijani bitta testga bog'lab, o'quvchilar profiliga saqlash</p>
+                <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>
+                  <select value={raschCalcAttachTestId} onChange={e=>setRaschCalcAttachTestId(e.target.value)} style={{...S.input,marginBottom:0,maxWidth:320,flex:"1 1 240px"}}>
+                    <option value="">— Testni tanlang —</option>
+                    {tests.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
+                  </select>
+                  <button onClick={attachRaschCalcToTest} disabled={!raschCalcAttachTestId||raschCalcAttaching} style={{...S.btnSmall,background:raschCalcAttachTestId?"#6D28D9":"#CBD5E1",padding:"11px 20px",fontSize:13,opacity:raschCalcAttaching?0.6:1}}>{raschCalcAttaching?"⏳ Saqlanmoqda...":"💾 Ushbu testga saqlash"}</button>
+                </div>
+                <p style={{margin:"8px 0 0",fontSize:11,color:C.textLight}}>Tanlangan test bo'yicha saytda topshirganlar + shu fayl birgalikda bitta Rash hisobida qayta hisoblanadi va mos o'quvchilarning profiliga yoziladi.</p>
+              </div>
+            )}
+
+            {raschCalcRows&&raschCalcRows.length>0&&(
+              <div style={{overflowX:"auto"}}>
+                <table style={S.table}>
+                  <thead><tr>{["#","F.I.O","Guruh","To'g'ri","Jami","Theta","Z-ball","BALL","Daraja"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                  <tbody>{[...raschCalcRows].sort((a,b)=>(b.ball??-999)-(a.ball??-999)).map((r,i)=>{
+                    const dg=r.daraja; const dc=dg==="NC"?C.danger:(dg==="C"||dg==="C+")?C.warning:C.successDark;
+                    return (
+                      <tr key={i} style={{background:i%2===0?C.card:"#FAFBFF"}}>
+                        <td style={S.td}>{i+1}</td>
+                        <td style={S.td}>{r.name}</td>
+                        <td style={S.td}>{r.group||"-"}</td>
+                        <td style={S.td}>{r.correct??"-"}</td>
+                        <td style={S.td}>{r.total??"-"}</td>
+                        <td style={S.td}>{r.theta!=null?r.theta.toFixed(3):"-"}</td>
+                        <td style={S.td}>{r.zBall!=null?r.zBall.toFixed(3):"-"}</td>
+                        <td style={S.td}><b style={{color:"#6D28D9"}}>{r.ball!=null?r.ball.toFixed(1):"-"}</b></td>
+                        <td style={S.td}>{dg?<span style={{...S.badge,background:dc+"22",color:dc,fontWeight:800}}>{dg}</span>:"-"}</td>
+                      </tr>
+                    );
+                  })}</tbody>
+                </table>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -3087,6 +4080,8 @@ function StudentDashboard({ user, onLogout }) {
   const [codeModal,setCodeModal]=useState(null); // test waiting for code entry
   const [codeInput,setCodeInput]=useState("");
   const [codeErr,setCodeErr]=useState("");
+  // Test faqat tanlangan guruh(lar)ga mo'ljallangan bo'lsa, o'quvchi o'z guruhida bo'lsagina ko'rsin
+  const visibleForMe = (t) => !t.targetGroups || t.targetGroups.length===0 || t.targetGroups.includes(user.group);
   const [unlockedTests,setUnlockedTests]=useState(()=>{
     try { return JSON.parse(localStorage.getItem("unlockedTests_"+user.phone)||"[]"); } catch { return []; }
   });
@@ -3141,7 +4136,7 @@ function StudentDashboard({ user, onLogout }) {
       {docModal&&(
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",flexDirection:"column"}}>
           <div style={{background:C.card,padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:`1px solid ${C.border}`}}>
-            <span style={{fontWeight:700,fontSize:16}}>{docModal.type==="pdf"?"📄":"∑"} Test varianti</span>
+            <span style={{fontWeight:700,fontSize:16}}>{docModal.type==="pdf"?"📄":"∑"} {docModal.name||"Test varianti"}</span>
             <button onClick={()=>setDocModal(null)} style={{...S.btnDanger,padding:"8px 14px"}}>✕ Yopish</button>
           </div>
           {docModal.type==="pdf"
@@ -3157,7 +4152,7 @@ function StudentDashboard({ user, onLogout }) {
           <div style={{...S.card,padding:28,maxWidth:380,width:"100%"}}>
             <div style={{textAlign:"center",marginBottom:16}}>
               <div style={{fontSize:44}}>🔒</div>
-              <h3 style={{margin:"8px 0 4px",fontSize:18}}>Pullik test</h3>
+              <h3 style={{margin:"8px 0 4px",fontSize:18}}>Maxfiy test</h3>
               <p style={{margin:0,color:C.textMid,fontSize:14}}>{codeModal.name}</p>
               {codeModal.codePrice&&<p style={{margin:"6px 0 0",color:"#92400E",fontWeight:700,fontSize:16}}>{codeModal.codePrice} so'm</p>}
             </div>
@@ -3189,10 +4184,10 @@ function StudentDashboard({ user, onLogout }) {
       <div style={{padding:20,maxWidth:800,margin:"0 auto"}}>
         {tab==="tests"&&(
           <div>
-            {tests.filter(t=>!t.active&&t.scheduledAt&&t.scheduledAt>now).length>0&&(
+            {tests.filter(t=>!t.active&&t.scheduledAt&&t.scheduledAt>now&&visibleForMe(t)).length>0&&(
               <div style={{marginBottom:24}}>
                 <h3 style={{marginBottom:16}}>🗓️ Rejalashtirilgan Testlar</h3>
-                {tests.filter(t=>!t.active&&t.scheduledAt&&t.scheduledAt>now).map(test=>(
+                {tests.filter(t=>!t.active&&t.scheduledAt&&t.scheduledAt>now&&visibleForMe(t)).map(test=>(
                   <div key={test.id} style={{...S.card,padding:18,marginBottom:12,border:`1.5px dashed ${C.primary}`}}>
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
                       <div>
@@ -3209,7 +4204,7 @@ function StudentDashboard({ user, onLogout }) {
               </div>
             )}
             <h3 style={{marginBottom:16}}>Faol Testlar</h3>
-            {tests.filter(t=>t.active).map(test=>{
+            {tests.filter(t=>t.active&&visibleForMe(t)).map(test=>{
               const myRes=results.find(r=>r.testId===test.id);
               let timeInfo=null, expired=false;
               if(test.startedAt){
@@ -3226,8 +4221,7 @@ function StudentDashboard({ user, onLogout }) {
                       <p style={{margin:"0 0 6px",color:C.textMid,fontSize:13}}>{test.questions?.length} savol • {test.duration} daqiqa</p>
                       <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
                         {timeInfo&&<span style={{...S.badge,background:expired?C.dangerLight:C.warningLight,color:expired?C.danger:C.warning,fontSize:12}}>⏱ {timeInfo}</span>}
-                        {test.pdfUrl&&<button onClick={()=>setDocModal({type:"pdf",url:test.pdfUrl})} style={{...S.badge,background:"#FEF3C7",color:"#92400E",border:"none",cursor:"pointer",fontSize:12}}>📄 Variantni ko'rish</button>}
-                        {test.latexSource&&<button onClick={()=>setDocModal({type:"latex",source:test.latexSource,id:test.id,images:test.latexImages})} style={{...S.badge,background:C.primaryLight,color:C.primary,border:"none",cursor:"pointer",fontSize:12}}>∑ Variantni ko'rish</button>}
+                        <DocLangButtons test={test} onOpen={setDocModal} small/>
                       </div>
                     </div>
                     {myRes?(
@@ -3244,7 +4238,7 @@ function StudentDashboard({ user, onLogout }) {
                 </div>
               );
             })}
-            {tests.filter(t=>t.active).length===0&&<div style={S.empty}>Hozircha faol testlar yo'q</div>}
+            {tests.filter(t=>t.active&&visibleForMe(t)).length===0&&<div style={S.empty}>Hozircha faol testlar yo'q</div>}
           </div>
         )}
         {tab==="monitoring"&&(
@@ -3258,7 +4252,10 @@ function StudentDashboard({ user, onLogout }) {
               return (
                 <div key={r.id} style={{...S.card,padding:18,marginBottom:12}}>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
-                    <div><h4 style={{margin:"0 0 4px",fontSize:15}}>{test.name}</h4><p style={{margin:0,color:C.textMid,fontSize:12}}>{new Date(r.id).toLocaleDateString("uz-UZ")}</p></div>
+                    <div><h4 style={{margin:"0 0 4px",fontSize:15}}>{test.name}</h4><p style={{margin:0,color:C.textMid,fontSize:12}}>{new Date(r.id).toLocaleDateString("uz-UZ")}</p>
+                      {r.rasch&&(()=>{ const dg=r.rasch.daraja; const dc=dg==="NC"?C.danger:(dg==="C"||dg==="C+")?C.warning:C.successDark;
+                        return <p style={{margin:"5px 0 0",display:"inline-flex",alignItems:"center",gap:6}}><span style={{fontSize:11,color:C.textMid}}>🎯 Rash:</span><b style={{color:"#6D28D9",fontSize:13}}>{r.rasch.ball.toFixed(1)}</b><span style={{background:dc+"22",color:dc,padding:"2px 8px",borderRadius:6,fontSize:11,fontWeight:800}}>{dg}</span></p>; })()}
+                    </div>
                     <div style={{textAlign:"right"}}>
                       <p style={{margin:"0 0 4px",fontWeight:800,fontSize:20,color:pct>=70?C.successDark:pct>=50?C.warning:C.danger}}>{r.totalScore}<span style={{color:C.textMid,fontWeight:400,fontSize:14}}>/{test.questions.length}</span></p>
                       {canView?<button onClick={()=>setViewResult(r)} style={{...S.btnSmall,background:C.primary,padding:"6px 14px",fontSize:12}}>Xatolarni Ko'rish</button>:<span style={{color:C.warning,fontSize:12}}>⏳ Keyinroq</span>}
@@ -3278,19 +4275,19 @@ function StudentDashboard({ user, onLogout }) {
           <div>
             <h3 style={{marginBottom:16}}>📄 Test Ko'rish</h3>
             <p style={{color:C.textMid,fontSize:13,marginBottom:16}}>Faol testlarning variantlarini (PDF yoki LaTeX) bu yerda ko'rishingiz mumkin.</p>
-            {tests.filter(t=>t.active && (t.pdfUrl || t.latexSource)).map(test=>(
+            {tests.filter(t=>t.active && testHasAnyDoc(t)).map(test=>(
               <div key={test.id} style={{...S.card,padding:18,marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
                 <div style={{display:"flex",alignItems:"center",gap:12}}>
-                  <div style={{width:44,height:44,borderRadius:10,background:test.pdfUrl?"#FEF3C7":C.primaryLight,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0}}>{test.pdfUrl?"📄":"∑"}</div>
+                  <div style={{width:44,height:44,borderRadius:10,background:C.primaryLight,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0}}>📄</div>
                   <div>
                     <h4 style={{margin:"0 0 2px",fontSize:15}}>{test.name}</h4>
-                    <p style={{margin:0,color:C.textMid,fontSize:12}}>{test.questions?.length} savol • {test.pdfUrl?"PDF":"LaTeX"}</p>
+                    <p style={{margin:0,color:C.textMid,fontSize:12}}>{test.questions?.length} savol • {availableDocLangs(test).map(l=>l.label).join(" / ")}</p>
                   </div>
                 </div>
-                <button onClick={()=>setDocModal(test.pdfUrl?{type:"pdf",url:test.pdfUrl,id:test.id}:{type:"latex",source:test.latexSource,id:test.id,images:test.latexImages})} style={{...S.btnSmall,background:C.primary,padding:"9px 18px"}}>👁 Ko'rish</button>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap"}}><DocLangButtons test={test} onOpen={setDocModal}/></div>
               </div>
             ))}
-            {tests.filter(t=>t.active && (t.pdfUrl || t.latexSource)).length===0&&<div style={S.empty}>Hozircha test variantlari mavjud emas</div>}
+            {tests.filter(t=>t.active && testHasAnyDoc(t)).length===0&&<div style={S.empty}>Hozircha test variantlari mavjud emas</div>}
           </div>
         )}
 
@@ -3385,7 +4382,7 @@ function StudentDashboard({ user, onLogout }) {
                   <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
                     <thead>
                       <tr style={{background:"#F8FAFF"}}>
-                        {["#","Test nomi","Sana","Ball","Natija","Holat"].map(h=>(
+                        {["#","Test nomi","Sana","Ball","Natija","Rash","Holat"].map(h=>(
                           <th key={h} style={{padding:"10px 12px",textAlign:"left",fontWeight:700,color:C.textMid,fontSize:12,whiteSpace:"nowrap",borderBottom:`1px solid ${C.border}`}}>{h}</th>
                         ))}
                       </tr>
@@ -3406,6 +4403,13 @@ function StudentDashboard({ user, onLogout }) {
                             <td style={{padding:"10px 12px",color:C.textMid,whiteSpace:"nowrap"}}>{date}</td>
                             <td style={{padding:"10px 12px",fontWeight:700,color: missed2 ? C.textLight : scoreColor(score,total)}}>
                               {missed2 ? "—" : `${score}/${total}`}
+                            </td>
+                            <td style={{padding:"10px 12px"}}>
+                              {r?.rasch
+                                ? (()=>{ const dg=r.rasch.daraja; const dc=dg==="NC"?C.danger:(dg==="C"||dg==="C+")?C.warning:C.successDark;
+                                  return <span style={{display:"inline-flex",alignItems:"center",gap:5}}><b style={{color:"#6D28D9",fontSize:13}}>{r.rasch.ball.toFixed(1)}</b><span style={{background:dc+"22",color:dc,padding:"2px 7px",borderRadius:6,fontSize:11,fontWeight:800}}>{dg}</span></span>; })()
+                                : <span style={{color:C.textLight,fontSize:12}}>—</span>
+                              }
                             </td>
                             <td style={{padding:"10px 12px"}}>
                               {missed2
@@ -3517,6 +4521,9 @@ function TestTaking({ test, user, onFinish, onExit }) {
   const [kbd,setKbd]=useState(null);
   const [showConfirm,setShowConfirm]=useState(false);
   const [pdfViewOpen,setPdfViewOpen]=useState(false);
+  const testDocLangs = useMemo(()=>availableDocLangs(test),[test]);
+  const [pdfViewLang,setPdfViewLang]=useState(testDocLangs[0]?.code||"uz");
+  const activeLangDoc = getLangDoc(test, pdfViewLang) || getLangDoc(test, testDocLangs[0]?.code);
   const startedAt=useRef(Date.now());
   const didSubmit=useRef(false);
 
@@ -3640,28 +4647,42 @@ function TestTaking({ test, user, onFinish, onExit }) {
           <p style={{margin:0,fontSize:10,color:C.textLight}}>Qolgan vaqt</p>
         </div>
         <div style={{display:"flex",gap:8}}>
-          {(test.pdfUrl||test.latexSource)&&<button onClick={()=>setPdfViewOpen(true)} style={{...S.btnSmall,background:"#F59E0B",padding:"9px 12px",fontSize:12,border:"none",cursor:"pointer"}}>{test.pdfUrl?"📄":"∑"} Test ko'rish</button>}
+          {testDocLangs.length>0&&<button onClick={()=>setPdfViewOpen(true)} style={{...S.btnSmall,background:"#F59E0B",padding:"9px 12px",fontSize:12,border:"none",cursor:"pointer"}}>{activeLangDoc?.pdfUrl?"📄":"∑"} Test ko'rish</button>}
           <button onClick={()=>setShowConfirm(true)} disabled={grading} style={{...S.btnSuccess,padding:"9px 16px",fontSize:13,opacity:grading?0.6:1}}>{grading?"⏳ Tekshirilmoqda...":"✅ Yakunlash"}</button>
           <button onClick={()=>setConfirmModal({message:"Testdan chiqasizmi? Belgilagan javoblaringiz saqlanadi, keyinroq davom ettirishingiz mumkin.", confirmLabel:"Chiqish", onConfirm:()=>{setConfirmModal(null);onExit();}})} style={{...S.btnDanger,padding:"9px 10px",fontSize:13}}>✕</button>
         </div>
       </div>
 
       {/* In-test PDF viewer — stays within TestTaking, timer keeps running,
-          answers preserved. User can switch back and forth freely. */}
-      {pdfViewOpen&&(test.pdfUrl||test.latexSource)&&(
-        <div style={{position:"fixed",inset:0,background:test.pdfUrl?"#1a1a1a":"white",zIndex:9000,display:"flex",flexDirection:"column"}}>
-          <div style={{background:"#F59E0B",padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          answers preserved. User can switch back and forth freely, and can
+          switch between the languages the test was uploaded in (UZ/QQ/RU). */}
+      {pdfViewOpen&&testDocLangs.length>0&&activeLangDoc&&(
+        <div style={{position:"fixed",inset:0,background:activeLangDoc.pdfUrl?"#1a1a1a":"white",zIndex:9000,display:"flex",flexDirection:"column"}}>
+          <div style={{background:"#F59E0B",padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
             <div>
-              <span style={{fontWeight:800,fontSize:15,color:"white"}}>{test.pdfUrl?"📄":"∑"} {test.name}</span>
+              <span style={{fontWeight:800,fontSize:15,color:"white"}}>{activeLangDoc.pdfUrl?"📄":"∑"} {test.name}</span>
               <p style={{margin:0,fontSize:11,color:"rgba(255,255,255,0.85)"}}>Vaqt davom etmoqda: {fmt(timeLeft)} • Javoblaringiz saqlanadi</p>
             </div>
-            <button onClick={()=>setPdfViewOpen(false)} style={{...S.btnSuccess,padding:"9px 16px",fontSize:13,background:"white",color:"#92400E",fontWeight:800}}>
-              ✏️ Javob berishga qaytish
-            </button>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              {testDocLangs.length>1&&(
+                <div style={{display:"flex",gap:4,background:"rgba(0,0,0,0.15)",padding:4,borderRadius:9}}>
+                  {testDocLangs.map(l=>(
+                    <button key={l.code} onClick={()=>setPdfViewLang(l.code)} style={{
+                      padding:"6px 10px",borderRadius:6,border:"none",cursor:"pointer",fontSize:12,fontWeight:800,
+                      background:pdfViewLang===l.code?"white":"transparent",
+                      color:pdfViewLang===l.code?"#92400E":"white"
+                    }}><LangFlag lang={l} size={13}/> {l.label}</button>
+                  ))}
+                </div>
+              )}
+              <button onClick={()=>setPdfViewOpen(false)} style={{...S.btnSuccess,padding:"9px 16px",fontSize:13,background:"white",color:"#92400E",fontWeight:800}}>
+                ✏️ Javob berishga qaytish
+              </button>
+            </div>
           </div>
-          {test.pdfUrl
-            ? <PdfViewer url={test.pdfUrl} persistKey={"pdf_scroll_"+test.id}/>
-            : <ScrollPersistDiv persistKey={"taking_latex_scroll_"+test.id} style={{flex:1,overflowY:"auto"}}><LatexDocViewer source={test.latexSource} images={test.latexImages}/></ScrollPersistDiv>
+          {activeLangDoc.pdfUrl
+            ? <PdfViewer url={activeLangDoc.pdfUrl} persistKey={"pdf_scroll_"+test.id+"_"+pdfViewLang}/>
+            : <ScrollPersistDiv persistKey={"taking_latex_scroll_"+test.id+"_"+pdfViewLang} style={{flex:1,overflowY:"auto"}}><LatexDocViewer source={activeLangDoc.latexSource} images={activeLangDoc.latexImages}/></ScrollPersistDiv>
           }
         </div>
       )}
@@ -3778,6 +4799,18 @@ function ResultDetail({ result, test, onBack }) {
             <div style={{width:`${pct}%`,height:"100%",background:pct>=70?C.success:pct>=50?C.warning:C.danger,borderRadius:999,transition:"width 1.5s"}}/>
           </div>
         </div>
+        {result.rasch&&(()=>{ const dg=result.rasch.daraja; const dc=dg==="NC"?C.danger:(dg==="C"||dg==="C+")?C.warning:C.successDark;
+          return (
+            <div style={{...S.card,padding:20,textAlign:"center",marginBottom:20,background:"linear-gradient(135deg,#F5F3FF,#FFFFFF)",border:"1.5px solid #DDD6FE"}}>
+              <p style={{margin:"0 0 8px",color:"#6D28D9",fontSize:13,fontWeight:800}}>🎯 RASH MODELI BO'YICHA BAHOLASH</p>
+              <div style={{display:"flex",justifyContent:"center",alignItems:"baseline",gap:14,flexWrap:"wrap"}}>
+                <div><div style={{fontSize:40,fontWeight:900,color:"#6D28D9",lineHeight:1}}>{result.rasch.ball.toFixed(1)}</div><div style={{fontSize:11,color:C.textMid}}>Rash ball</div></div>
+                <div><span style={{background:dc+"22",color:dc,padding:"6px 16px",borderRadius:10,fontSize:20,fontWeight:900}}>{dg}</span><div style={{fontSize:11,color:C.textMid,marginTop:4}}>Daraja</div></div>
+              </div>
+              <p style={{margin:"10px 0 0",fontSize:11,color:C.textLight}}>Sinf/guruh o'rtachasiga nisbatan hisoblangan (logistik model). Hisoblangan sana: {new Date(result.rasch.calculatedAt).toLocaleDateString("uz-UZ")}</p>
+            </div>
+          );
+        })()}
         {closedQs.length>0&&(
           <div style={{...S.card,padding:18,marginBottom:16}}>
             <h3 style={{margin:"0 0 14px",color:C.primary}}>Yopiq Savollar</h3>
@@ -3810,9 +4843,9 @@ function ResultDetail({ result, test, onBack }) {
                 return (
                   <div key={si} style={{display:"flex",gap:8,alignItems:"flex-start",flexWrap:"wrap",padding:"10px",borderRadius:8,background:ok?C.successLight:C.dangerLight,marginBottom:6}}>
                     <span style={{color:C.warning,fontWeight:700,minWidth:40}}>{idx+1}{sp.label})</span>
-                    <span style={{color:ok?C.successDark:C.danger,fontWeight:600,fontSize:18,display:"inline-flex",alignItems:"center",flexWrap:"wrap",gap:2}}>{stu?parseToNodes(stu).map(n=>renderNode(n,null,()=>{})):<span style={{color:C.textLight}}>—</span>}</span>
+                    <span style={{color:ok?C.successDark:C.danger,fontWeight:600,fontSize:18,display:"inline-flex",alignItems:"center",flexWrap:"wrap",gap:2}}>{stu?<KatexSpan latex={toLatex(stu)} fontSize={18}/>:<span style={{color:C.textLight}}>—</span>}</span>
                     <span style={{color:C.textMid}}>→</span>
-                    <span style={{display:"inline-flex",flexWrap:"wrap",gap:2,alignItems:"center",color:C.successDark,fontWeight:600,fontSize:18}}>{parseToNodes(sp.answer||"").map(n=>renderNode(n,null,()=>{}))}</span>
+                    <span style={{display:"inline-flex",flexWrap:"wrap",gap:2,alignItems:"center",color:C.successDark,fontWeight:600,fontSize:18}}><KatexSpan latex={toLatex(sp.answer||"")} fontSize={18}/></span>
                     <span style={{marginLeft:"auto"}}>{ok?"✅":"❌"}</span>
                   </div>
                 );
@@ -3821,9 +4854,9 @@ function ResultDetail({ result, test, onBack }) {
                 const stu=result.openAnswers?.[idx];
                 return (
                   <div style={{display:"flex",gap:8,alignItems:"flex-start",flexWrap:"wrap",padding:"10px",borderRadius:8,background:ok?C.successLight:C.dangerLight}}>
-                    <span style={{color:ok?C.successDark:C.danger,fontWeight:600,fontSize:18,display:"inline-flex",alignItems:"center",flexWrap:"wrap",gap:2}}>{stu?parseToNodes(stu).map(n=>renderNode(n,null,()=>{})):<span style={{color:C.textLight,fontSize:14}}>Javob berilmadi</span>}</span>
+                    <span style={{color:ok?C.successDark:C.danger,fontWeight:600,fontSize:18,display:"inline-flex",alignItems:"center",flexWrap:"wrap",gap:2}}>{stu?<KatexSpan latex={toLatex(stu)} fontSize={18}/>:<span style={{color:C.textLight,fontSize:14}}>Javob berilmadi</span>}</span>
                     <span style={{color:C.textMid}}>→</span>
-                    <span style={{color:C.successDark,fontWeight:600,fontSize:18,display:"inline-flex",alignItems:"center",flexWrap:"wrap",gap:2}}>{parseToNodes(q.correctAnswer||"").map(n=>renderNode(n,null,()=>{}))}</span>
+                    <span style={{color:C.successDark,fontWeight:600,fontSize:18,display:"inline-flex",alignItems:"center",flexWrap:"wrap",gap:2}}><KatexSpan latex={toLatex(q.correctAnswer||"")} fontSize={18}/></span>
                     <span style={{marginLeft:"auto"}}>{ok?"✅":"❌"}</span>
                   </div>
                 );
@@ -3910,11 +4943,31 @@ function SplashScreen({ onDone }) {
 }
 
 export default function App() {
-  const [page,setPage]=useState("login");
-  const [user,setUser]=useState(null);
-  const [isAdmin,setIsAdmin]=useState(false);
-  const [isTeacher,setIsTeacher]=useState(false);
-  const [teacherInfo,setTeacherInfo]=useState(null);
+  // Saqlangan sessiya bo'lsa (avval login qilingan bo'lsa), avtomatik tiklaymiz —
+  // login/parol qayta so'ralmaydi. Foydalanuvchi ma'lumoti bazadan yangilanib olinadi
+  // (masalan boshqa qurilmada tahrirlangan bo'lishi mumkin).
+  const initFromSession = () => {
+    const s = loadSession();
+    if (!s) return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null };
+    if (s.role === "admin") return { page: "admin", user: null, isAdmin: true, isTeacher: false, teacherInfo: null };
+    if (s.role === "teacher") {
+      const t = (db.get("teachers")||[]).find(x => x.id === s.teacherId);
+      if (!t) { clearSession(); return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null }; }
+      return { page: "teacher", user: null, isAdmin: false, isTeacher: true, teacherInfo: t };
+    }
+    if (s.role === "student") {
+      const u = (db.get("users")||[]).find(x => x.phone === s.phone);
+      if (!u) { clearSession(); return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null }; }
+      return { page: "student", user: u, isAdmin: false, isTeacher: false, teacherInfo: null };
+    }
+    return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null };
+  };
+  const initState = initFromSession();
+  const [page,setPage]=useState(initState.page);
+  const [user,setUser]=useState(initState.user);
+  const [isAdmin,setIsAdmin]=useState(initState.isAdmin);
+  const [isTeacher,setIsTeacher]=useState(initState.isTeacher);
+  const [teacherInfo,setTeacherInfo]=useState(initState.teacherInfo);
   const [showSplash,setShowSplash]=useState(true);
   useEffect(()=>{
     initDB();
@@ -3933,7 +4986,7 @@ export default function App() {
     if (!document.getElementById("math-blink-style")) {
       const st = document.createElement("style");
       st.id = "math-blink-style";
-      st.textContent = "@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}";
+      st.textContent = "@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}@keyframes slotPulse{0%,100%{border-color:#6366F1;box-shadow:0 0 0 0 rgba(99,102,241,0.35)}50%{border-color:#A5B4FC;box-shadow:0 0 0 3px rgba(99,102,241,0.12)}}";
       document.head.appendChild(st);
     }
     // Prevent double-tap zoom
@@ -3941,16 +4994,16 @@ export default function App() {
   },[]);
 
   if(showSplash) return <SplashScreen onDone={()=>setShowSplash(false)}/>;
-  if(page==="admin"&&isAdmin) return <AdminPanel isFullAdmin={true} onLogout={()=>{setIsAdmin(false);setPage("login");}}/>;
-  if(page==="teacher"&&isTeacher) return <AdminPanel isFullAdmin={false} teacherInfo={teacherInfo} onLogout={()=>{setIsTeacher(false);setTeacherInfo(null);setPage("login");}}/>;
-  if(page==="student"&&user) return <StudentDashboard user={user} onLogout={()=>{setUser(null);setPage("login");}}/>;
-  if(page==="register") return <RegisterPage onDone={u=>{setUser(u);setPage("student");}} onLogin={()=>setPage("login")}/>;
+  if(page==="admin"&&isAdmin) return <AdminPanel isFullAdmin={true} onLogout={()=>{setIsAdmin(false);setPage("login");clearSession();}}/>;
+  if(page==="teacher"&&isTeacher) return <AdminPanel isFullAdmin={false} teacherInfo={teacherInfo} onLogout={()=>{setIsTeacher(false);setTeacherInfo(null);setPage("login");clearSession();}}/>;
+  if(page==="student"&&user) return <StudentDashboard user={user} onLogout={()=>{setUser(null);setPage("login");clearSession();}}/>;
+  if(page==="register") return <RegisterPage onDone={u=>{setUser(u);setPage("student");saveSession({role:"student",phone:u.phone});}} onLogin={()=>setPage("login")}/>;
   return <LoginPage
-    onLogin={u=>{setUser(u);setPage("student");}}
+    onLogin={u=>{setUser(u);setPage("student");saveSession({role:"student",phone:u.phone});}}
     onRegister={()=>setPage("register")}
     onAdmin={(fullAdmin, teacher)=>{
-      if(fullAdmin){ setIsAdmin(true); setPage("admin"); }
-      else { setIsTeacher(true); setTeacherInfo(teacher); setPage("teacher"); }
+      if(fullAdmin){ setIsAdmin(true); setPage("admin"); saveSession({role:"admin"}); }
+      else { setIsTeacher(true); setTeacherInfo(teacher); setPage("teacher"); saveSession({role:"teacher",teacherId:teacher.id}); }
     }}
   />;
 }
