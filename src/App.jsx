@@ -1,4 +1,4 @@
-aimport { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
 import * as XLSX from "xlsx";
 
 // ===== KaTeX CDN loader =====
@@ -893,7 +893,7 @@ function autoActivateScheduledTests() {
   const next = ts.map(t => {
     if (!t.active && t.scheduledAt && t.scheduledAt <= now) {
       changed = true;
-      return { ...t, active: true, startedAt: t.scheduledAt };
+      return { ...t, active: true, startedAt: t.scheduledAt, everActivated: true };
     }
     return t;
   });
@@ -1758,10 +1758,10 @@ function importRaschFromRows(test, rows, settings = DEFAULT_RASCH_SETTINGS) {
     if (siteIdx >= 0) siteIdxUsed.add(siteIdx);
     if (hasRaw) {
       const th = raschTheta(correct, tot);
-      if (th !== null && isFinite(th)) { combined.push({ name: rec.name, correct, total: tot, theta: th, siteIdx }); return; }
+      if (th !== null && isFinite(th)) { combined.push({ name: rec.name, correct, total: tot, theta: th, siteIdx, batchId: rec.batchId ?? null }); return; }
     }
     // faqat tayyor BALL berilgan (xom to'g'ri/jami yo'q) — theta hisoblab bo'lmaydi, ball o'zi saqlanadi
-    combined.push({ name: rec.name, correct: null, total: null, theta: null, siteIdx, directBall: rec.ball, directDaraja: rec.daraja });
+    combined.push({ name: rec.name, correct: null, total: null, theta: null, siteIdx, directBall: rec.ball, directDaraja: rec.daraja, batchId: rec.batchId ?? null });
   });
 
   // 2) Saytda shu testni topshirgan, lekin fayl orqali "yangilanmagan" (faylda yo'q) o'quvchilar
@@ -1783,6 +1783,7 @@ function importRaschFromRows(test, rows, settings = DEFAULT_RASCH_SETTINGS) {
 
   let matched = 0;
   const fileOnly = [];
+  const fileRows = []; // ushbu fayldan kelgan HAR bir qator (saytga mos kelgan yoki kelmagan — barchasi)
   const updated = all.map(r => ({ ...r }));
   combined.forEach(e => {
     let ball, zBall = null, theta = e.theta ?? null;
@@ -1801,12 +1802,41 @@ function importRaschFromRows(test, rows, settings = DEFAULT_RASCH_SETTINGS) {
         theta, zBall, ball, daraja, calculatedAt, settings,
         source: e.name ? "site+upload" : "site",
       }};
+      if (e.name) fileRows.push({ name: e.name, correct: e.correct, total: e.total ?? total, ball, daraja, matchedSite: true, batchId: e.batchId ?? null });
     } else if (e.name) {
       fileOnly.push({ name: e.name, correct: e.correct, total: e.total, theta, zBall, ball, daraja });
+      fileRows.push({ name: e.name, correct: e.correct, total: e.total, ball, daraja, matchedSite: false, batchId: e.batchId ?? null });
     }
   });
   db.set("results", updated);
-  return { matched, fileOnly, unusable, calculatedAt, combinedCount: combined.length };
+  return { matched, fileOnly, fileRows, unusable, calculatedAt, combinedCount: combined.length };
+}
+
+// Bitta test uchun: saytda topshirganlar + BARCHA hamkor markazlarning shu testga
+// "kutilayotgan" (hali hisoblanmagan) Excel yuklamalari — hammasi BITTA umumiy Rash
+// hisobida birlashtirilib hisoblanadi. Faqat admin/yordamchi o'qituvchi shu funksiyani
+// chaqirganda ishga tushadi — hamkor markaz fayl yuklagan zahoti EMAS.
+function calculateRaschCombined(test, settings = DEFAULT_RASCH_SETTINGS) {
+  const allUploads = db.get("partnerUploads") || [];
+  const pendingBatches = allUploads.filter(u => u.testId === test.id && u.status !== "processed");
+  const taggedRows = [];
+  pendingBatches.forEach(b => {
+    (b.rawRows || b.rows || []).forEach(r => taggedRows.push({ ...r, batchId: b.id }));
+  });
+  const r = importRaschFromRows(test, taggedRows, settings);
+  if (pendingBatches.length) {
+    const byBatch = {};
+    r.fileRows.forEach(fr => { if (fr.batchId != null) { (byBatch[fr.batchId] = byBatch[fr.batchId] || []).push(fr); } });
+    const updatedUploads = allUploads.map(u => {
+      if (u.testId === test.id && u.status !== "processed") {
+        return { ...u, status: "processed", processedAt: r.calculatedAt, rows: byBatch[u.id] || u.rows };
+      }
+      return u;
+    });
+    db.set("partnerUploads", updatedUploads);
+  }
+  db.set("tests", (db.get("tests")||[]).map(t=>t.id===test.id?{...t,raschSettings:settings,raschCalculatedAt:r.calculatedAt}:t));
+  return { ...r, partnerBatchesProcessed: pendingBatches.length, partnerCentersCount: new Set(pendingBatches.map(b=>b.partnerId)).size };
 }
 
 // ===== EXCEL EXPORT (SheetJS .xlsx) =====
@@ -2833,7 +2863,7 @@ function AuthLayout({ children }) {
     </div>
   );
 }
-function LoginPage({ onLogin, onRegister, onAdmin }) {
+function LoginPage({ onLogin, onRegister, onAdmin, onPartner, onPartnerRegister }) {
   const [login, setLogin] = useState("");
   const [pwd, setPwd] = useState("");
   const [err, setErr] = useState("");
@@ -2856,7 +2886,16 @@ function LoginPage({ onLogin, onRegister, onAdmin }) {
       return;
     }
 
-    // 3. Check student database
+    // 3. Check partner center accounts (faqat Excel yuklash huquqi bilan)
+    const partners = db.get("partners") || [];
+    const partner = partners.find(p => p.login === login.trim() && p.password === pwd);
+    if (partner) {
+      if (!partner.approved) { setErr("Hisobingiz hali admin tomonidan tasdiqlanmagan. Iltimos, kuting yoki admin bilan bog'laning."); return; }
+      onPartner(partner);
+      return;
+    }
+
+    // 4. Check student database
     const u = (db.get("users")||[]).find(u => u.phone === login.trim());
     if (!u) { setErr("Login yoki parol noto'g'ri!"); return; }
     if (u.password !== pwd) { setErr("Login yoki parol noto'g'ri!"); return; }
@@ -2886,6 +2925,9 @@ function LoginPage({ onLogin, onRegister, onAdmin }) {
       <button onClick={go} style={S.btnPrimary}>Kirish</button>
       <p style={{textAlign:"center",color:C.textMid,fontSize:13,margin:"12px 0 0"}}>
         Hisobingiz yo'qmi? <span onClick={onRegister} style={{color:C.primary,cursor:"pointer",fontWeight:700}}>Ro'yxatdan o'ting</span>
+      </p>
+      <p style={{textAlign:"center",color:C.textMid,fontSize:13,margin:"6px 0 0"}}>
+        Hamkor o'quv markazmisiz? <span onClick={onPartnerRegister} style={{color:"#0891B2",cursor:"pointer",fontWeight:700}}>Shu yerda ro'yxatdan o'ting</span>
       </p>
     </AuthLayout>
   );
@@ -2927,6 +2969,72 @@ function RegisterPage({ onDone, onLogin }) {
         onKeyDown={e=>e.key==="Enter"&&go()} style={S.input} placeholder="Parolni qayta kiriting"/>
       <button onClick={go} style={S.btnPrimary}>Ro'yxatdan O'tish</button>
       <p style={{textAlign:"center",color:C.textMid,fontSize:13,marginTop:12}}>Hisobingiz bormi? <span onClick={onLogin} style={{color:C.primary,cursor:"pointer",fontWeight:700}}>Kirish</span></p>
+    </AuthLayout>
+  );
+}
+
+
+// ===== HAMKOR MARKAZ — O'ZI RO'YXATDAN O'TISHI =====
+// Ro'yxatdan o'tgach hisob DARHOL faollashmaydi — admin PartnerManager orqali
+// tasdiqlaguncha "kutilmoqda" holatida turadi va kirish rad etiladi.
+function PartnerRegisterPage({ onDone, onLogin }) {
+  const [f,setF]=useState({name:"",login:"",password:"",password2:"",contact:""});
+  const [err,setErr]=useState("");
+  const [showPwd,setShowPwd]=useState(false);
+  const [done,setDone]=useState(false);
+
+  const go=()=>{
+    if(!f.name.trim()||!f.login.trim()||!f.password){setErr("Barcha majburiy maydonlarni to'ldiring!");return;}
+    if(f.password.length<4){setErr("Parol kamida 4 ta belgidan iborat bo'lsin!");return;}
+    if(f.password!==f.password2){setErr("Parollar mos kelmadi!");return;}
+    if(f.login.trim()===ADMIN_LOGIN){setErr("Bu login band, boshqasini tanlang!");return;}
+    const teachers=db.get("teachers")||[], partners=db.get("partners")||[];
+    if(teachers.find(t=>t.login===f.login.trim())||partners.find(p=>p.login===f.login.trim())){setErr("Bu login band, boshqasini tanlang!");return;}
+    const p={id:Date.now(),name:f.name.trim(),login:f.login.trim(),password:f.password,contact:f.contact.trim(),approved:false,createdAt:Date.now()};
+    db.set("partners",[...partners,p]);
+    setDone(true);
+  };
+
+  if (done) {
+    return (
+      <AuthLayout>
+        <div style={{textAlign:"center",marginBottom:20}}>
+          <div style={{fontSize:52}}>⏳</div>
+          <h1 style={{margin:"8px 0 0",fontSize:20,fontWeight:800}}>So'rov yuborildi</h1>
+        </div>
+        <p style={{textAlign:"center",color:C.textMid,fontSize:14,lineHeight:1.6,margin:"0 0 20px"}}>
+          Arizangiz qabul qilindi. Admin tasdiqlagandan so'ng, shu login va parol bilan kira olasiz. Iltimos, admin bilan bog'lanib xabar bering.
+        </p>
+        <button onClick={onLogin} style={S.btnPrimary}>Kirish sahifasiga qaytish</button>
+      </AuthLayout>
+    );
+  }
+
+  return (
+    <AuthLayout>
+      <div style={{textAlign:"center",marginBottom:24}}><div style={{fontSize:52}}>🤝</div><h1 style={{margin:"8px 0 0",fontSize:20,fontWeight:800}}>Hamkor Markaz — Ro'yxatdan O'tish</h1></div>
+      <p style={{textAlign:"center",color:C.textLight,fontSize:12.5,margin:"0 0 16px",lineHeight:1.5}}>Ro'yxatdan o'tgach, admin tasdiqlashini kutasiz — shundan keyingina kira olasiz.</p>
+      {err&&<div style={S.err}>{err}</div>}
+      <label style={S.label}>Markaz nomi</label>
+      <input value={f.name} onChange={e=>setF({...f,name:e.target.value})} style={S.input} placeholder="Masalan: 'Iqtidor' o'quv markazi"/>
+      <label style={S.label}>Login (unikal)</label>
+      <input value={f.login} onChange={e=>setF({...f,login:e.target.value})} style={S.input} placeholder="login"/>
+      <label style={S.label}>Bog'lanish uchun (telefon/Telegram) — ixtiyoriy</label>
+      <input value={f.contact} onChange={e=>setF({...f,contact:e.target.value})} style={S.input} placeholder="+998... yoki @username"/>
+      <label style={S.label}>Parol</label>
+      <div style={{position:"relative"}}>
+        <input type={showPwd?"text":"password"} value={f.password} onChange={e=>setF({...f,password:e.target.value})}
+          style={{...S.input,paddingRight:44}} placeholder="Kamida 4 ta belgi"/>
+        <button onClick={()=>setShowPwd(s=>!s)} type="button"
+          style={{position:"absolute",right:10,top:10,background:"none",border:"none",cursor:"pointer",fontSize:18,color:C.textMid}}>
+          {showPwd?"🙈":"👁"}
+        </button>
+      </div>
+      <label style={S.label}>Parolni takrorlang</label>
+      <input type={showPwd?"text":"password"} value={f.password2} onChange={e=>setF({...f,password2:e.target.value})}
+        onKeyDown={e=>e.key==="Enter"&&go()} style={S.input} placeholder="Parolni qayta kiriting"/>
+      <button onClick={go} style={{...S.btnPrimary,background:"#0891B2"}}>Ro'yxatdan O'tish</button>
+      <p style={{textAlign:"center",color:C.textMid,fontSize:13,marginTop:12}}>Hisobingiz bormi? <span onClick={onLogin} style={{color:"#0891B2",cursor:"pointer",fontWeight:700}}>Kirish</span></p>
     </AuthLayout>
   );
 }
@@ -3113,7 +3221,7 @@ function TestCreator({ existing, onSave, onCancel }) {
       };
     });
     const uzDoc = cleanLangDocs.uz;
-    onSave({id:existing?.id||Date.now(),name,duration,closedCount:questions.filter(q=>q.type==="closed").length,optionsCount:sections[0]?typeOpts(sections[0].type):4,sections,questions,active:willAutoStart?false:wasActive,scheduledAt:schedTs,showAnswersAfter:showAnswers,showStats,startedAt:existing?.startedAt||null,langDocs:cleanLangDocs,pdfUrl:uzDoc.pdfUrl,latexSource:uzDoc.latexSource,latexFileName:uzDoc.latexFileName,latexImages:uzDoc.latexImages,accessCode:requireCode?accessCode.trim().toUpperCase():null,codePrice:requireCode?codePrice:null,targetGroups:restrictGroups?targetGroups:[]});
+    onSave({id:existing?.id||Date.now(),name,duration,closedCount:questions.filter(q=>q.type==="closed").length,optionsCount:sections[0]?typeOpts(sections[0].type):4,sections,questions,active:willAutoStart?false:wasActive,everActivated:existing?.everActivated||(willAutoStart?false:wasActive),scheduledAt:schedTs,showAnswersAfter:showAnswers,showStats,startedAt:existing?.startedAt||null,langDocs:cleanLangDocs,pdfUrl:uzDoc.pdfUrl,latexSource:uzDoc.latexSource,latexFileName:uzDoc.latexFileName,latexImages:uzDoc.latexImages,accessCode:requireCode?accessCode.trim().toUpperCase():null,codePrice:requireCode?codePrice:null,targetGroups:restrictGroups?targetGroups:[]});
   };
 
   const grouped=()=>{
@@ -3590,6 +3698,109 @@ function TeacherManager() {
   );
 }
 
+// Hamkor o'quv markazlar — faqat o'z Excel natijalarini yuklash huquqiga ega,
+// boshqa hech narsani (o'quvchilar, boshqa testlar, natijalar ro'yxati) ko'rmaydi.
+// Admin ular uchun shu yerda login/parol yaratib beradi.
+function PartnerManager() {
+  const [list, setList] = useState(()=>db.get("partners")||[]);
+  const [form, setForm] = useState({name:"",login:"",password:""});
+  const [showPwd, setShowPwd] = useState(false);
+  const [err, setErr] = useState("");
+  const [confirmModal, setConfirmModal] = useState(null);
+
+  const add = () => {
+    if(!form.name.trim()||!form.login.trim()||!form.password){setErr("Barcha maydonlarni to'ldiring!");return;}
+    if(form.password.length<4){setErr("Parol kamida 4 ta belgi!");return;}
+    if(form.login.trim()===ADMIN_LOGIN){setErr("Bu login band!");return;}
+    const curT=db.get("teachers")||[], curP=db.get("partners")||[];
+    if(curT.find(t=>t.login===form.login.trim())||curP.find(t=>t.login===form.login.trim())){setErr("Bu login band!");return;}
+    // Admin o'zi to'g'ridan-to'g'ri qo'shgani uchun darhol tasdiqlangan hisoblanadi
+    const upd=[...curP,{id:Date.now(),name:form.name.trim(),login:form.login.trim(),password:form.password,approved:true,createdAt:Date.now()}];
+    db.set("partners",upd); setList(upd);
+    setForm({name:"",login:"",password:""}); setErr("");
+  };
+
+  const del = (id) => {
+    setConfirmModal({message:"Hamkor markaz o'chirilsinmi?", onConfirm: () => {
+      const upd=(db.get("partners")||[]).filter(t=>t.id!==id);
+      db.set("partners",upd); setList(upd);
+      setConfirmModal(null);
+    }});
+  };
+
+  const approve = (id) => {
+    const upd=(db.get("partners")||[]).map(p=>p.id===id?{...p,approved:true}:p);
+    db.set("partners",upd); setList(upd);
+  };
+
+  const pending = list.filter(p=>!p.approved);
+  const approved = list.filter(p=>p.approved);
+
+  return (
+    <div style={{...S.card,padding:16,marginBottom:18,border:`2px solid #0891B2`}}>
+      {confirmModal && <ConfirmModal message={confirmModal.message} onConfirm={confirmModal.onConfirm} onCancel={()=>setConfirmModal(null)}/>}
+      <h3 style={{margin:"0 0 6px",fontSize:15,color:"#0891B2"}}>🤝 Hamkor o'quv markazlar</h3>
+      <p style={{margin:"0 0 14px",fontSize:12,color:C.textLight,lineHeight:1.5}}>Ular faqat o'zlariga berilgan login/parol bilan kirib, bitta testni tanlab, o'z Excel natijalarini yuklay oladi (saytdagi natijalar bilan birga bitta Rash hisobida qo'shiladi). Boshqa hech qanday ma'lumotni (o'quvchilar, testlar tarkibi va h.k.) ko'rmaydi. O'zlari ham "Kirish" sahifasidan ro'yxatdan o'ta oladi — lekin siz shu yerda tasdiqlamaguningizcha kira olmaydilar.</p>
+
+      {pending.length>0 && (
+        <div style={{marginBottom:16,padding:12,background:"#FFFBEB",border:"1.5px solid #FDE68A",borderRadius:10}}>
+          <p style={{margin:"0 0 10px",fontSize:13,fontWeight:800,color:"#92400E"}}>⏳ Tasdiqlanishi kerak ({pending.length})</p>
+          {pending.map(p=>(
+            <div key={p.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,padding:"8px 0",borderTop:"1px solid #FDE68A"}}>
+              <div>
+                <b style={{fontSize:13}}>{p.name}</b>
+                <p style={{margin:"2px 0 0",fontSize:11.5,color:C.textLight}}>login: <code>{p.login}</code>{p.contact?` • ${p.contact}`:""}</p>
+              </div>
+              <div style={{display:"flex",gap:6,flexShrink:0}}>
+                <button onClick={()=>approve(p.id)} style={{...S.btnSmall,background:C.successDark,padding:"6px 10px",fontSize:12}}>✅ Tasdiqlash</button>
+                <button onClick={()=>del(p.id)} style={{...S.btnSmall,background:C.danger,padding:"6px 10px",fontSize:12}}>🗑</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {err&&<div style={S.err}>{err}</div>}
+      <p style={{margin:"0 0 8px",fontSize:12,fontWeight:700,color:C.textMid}}>Yoki o'zingiz qo'shing:</p>
+      <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
+        {[["Nomi","name","text","Markaz nomi"],["Login","login","text","login (unikal)"],["Parol","password",showPwd?"text":"password","min 4 ta belgi"]].map(([lbl,k,tp,ph])=>(
+          <div key={k} style={{display:"flex",gap:8,alignItems:"center"}}>
+            <label style={{...S.label,margin:0,minWidth:56,fontSize:12}}>{lbl}</label>
+            <div style={{flex:1,position:"relative"}}>
+              <input type={tp} value={form[k]} onChange={e=>setForm(p=>({...p,[k]:e.target.value}))}
+                style={{...S.input,margin:0,fontSize:13}} placeholder={ph}
+                onKeyDown={e=>e.key==="Enter"&&add()}/>
+              {k==="password"&&<button onClick={()=>setShowPwd(s=>!s)} type="button"
+                style={{position:"absolute",right:8,top:10,background:"none",border:"none",cursor:"pointer",fontSize:16}}>{showPwd?"🙈":"👁"}</button>}
+            </div>
+          </div>
+        ))}
+        <button onClick={add} style={{...S.btnSmall,margin:0,padding:"10px",fontSize:13,background:"#0891B2"}}>+ Qo'shish (darhol tasdiqlangan)</button>
+      </div>
+      {approved.length===0
+        ? <p style={{color:C.textLight,fontSize:13,margin:0,textAlign:"center"}}>Hali tasdiqlangan hamkor markaz yo'q</p>
+        : <table style={{...S.table,fontSize:13}}>
+            <thead><tr>{["","Nomi","Login","Amal"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+            <tbody>{approved.map(t=>(
+              <tr key={t.id}>
+                <td style={S.td}>
+                  {t.logo
+                    ? <img src={t.logo} alt="" style={{width:28,height:28,borderRadius:6,objectFit:"cover"}}/>
+                    : <div style={{width:28,height:28,borderRadius:6,background:"#CFFAFE",display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}}>🤝</div>}
+                </td>
+                <td style={S.td}><b>{t.name}</b></td>
+                <td style={S.td}><code style={{background:"#CFFAFE",color:"#0891B2",padding:"2px 8px",borderRadius:4,fontSize:12}}>{t.login}</code></td>
+                <td style={S.td}>
+                  <button onClick={()=>del(t.id)} style={{...S.btnSmall,background:C.danger,padding:"4px 10px",fontSize:12}}>🗑 O'chirish</button>
+                </td>
+              </tr>
+            ))}</tbody>
+          </table>
+      }
+    </div>
+  );
+}
+
 
 function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
   const roleName = isFullAdmin ? "Admin" : (teacherInfo?.name || "O'qituvchi");
@@ -3714,15 +3925,17 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
     const { test, settings } = raschModal;
     setRaschBusyId(test.id);
     setTimeout(() => { // UI qotib qolmasligi uchun keyingi tikda hisoblaymiz
-      const r = computeRaschForTest(test, settings);
-      if (r.count > 0) {
-        db.set("tests", (db.get("tests")||[]).map(t=>t.id===test.id?{...t,raschSettings:settings,raschCalculatedAt:r.calculatedAt,raschMean:r.mean,raschStd:r.std}:t));
-      }
+      const r = calculateRaschCombined(test, settings);
       setRaschBusyId(null);
       setRaschModal(null);
       reload();
-      setRaschDoneMsg(r.count>0?`🎯 "${test.name}" — ${r.count} ta o'quvchi natijasi Rash modeli bo'yicha hisoblandi.`:`"${test.name}" bo'yicha hali hech kim test topshirmagan.`);
-      setTimeout(()=>setRaschDoneMsg(null), 4500);
+      const totalCount = r.matched + (r.fileOnly?.length || 0);
+      let msg = totalCount>0
+        ? `🎯 "${test.name}" — ${r.matched} ta o'quvchi profiliga yozildi.`
+        : `"${test.name}" bo'yicha hali hech kim test topshirmagan va hamkor markazlardan ham fayl kelmagan.`;
+      if (r.partnerBatchesProcessed>0) msg += ` ${r.partnerCentersCount} ta hamkor markazning ${r.partnerBatchesProcessed} ta fayli ham shu hisobga qo'shildi.`;
+      setRaschDoneMsg(msg);
+      setTimeout(()=>setRaschDoneMsg(null), 5500);
     }, 30);
   };
 
@@ -3766,7 +3979,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
       db.set("tests",(db.get("tests")||[]).filter(t=>t.id!==id));reload();setConfirmModal(null);
     }});
   };
-  const toggleActive=(id)=>{db.set("tests",(db.get("tests")||[]).map(t=>t.id===id?{...t,active:!t.active,startedAt:!t.active?Date.now():null,scheduledAt:null}:t));reload();};
+  const toggleActive=(id)=>{db.set("tests",(db.get("tests")||[]).map(t=>t.id===id?{...t,active:!t.active,startedAt:!t.active?Date.now():null,scheduledAt:null,everActivated:t.everActivated||!t.active}:t));reload();};
   const deleteUser=(phone)=>{
     setConfirmModal({message:"Foydalanuvchi o'chirilsinmi?", onConfirm: () => {
       db.set("users",(db.get("users")||[]).filter(u=>u.phone!==phone));reload();setConfirmModal(null);
@@ -3863,6 +4076,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
             {(creating||editing)&&<TestCreator existing={editing} onSave={saveTest} onCancel={()=>{setCreating(false);setEditing(null);}}/>}
             {tests.map(test=>{
               const tr=results.filter(r=>r.testId===test.id);
+              const pendingPartners=(db.get("partnerUploads")||[]).filter(u=>u.testId===test.id&&u.status!=="processed").length;
               const endAt=test.startedAt?new Date(test.startedAt+test.duration*60000).toLocaleTimeString("uz-UZ",{hour:"2-digit",minute:"2-digit"}):null;
               return (
                 <div key={test.id} style={{...S.card,padding:18,marginBottom:12}}>
@@ -3884,13 +4098,14 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                         {test.accessCode&&<span style={{...S.badge,background:"#FEF3C7",color:"#92400E"}}>🔒 Kod: {test.accessCode}{test.codePrice?` (${test.codePrice} so'm)`:""}</span>}
                         {test.targetGroups&&test.targetGroups.length>0&&<span style={{...S.badge,background:C.primaryLight,color:C.primary}}>👥 {test.targetGroups.join(", ")}</span>}
                         {test.raschCalculatedAt&&<span style={{...S.badge,background:"#EDE9FE",color:"#6D28D9"}}>🎯 Rash hisoblangan ({new Date(test.raschCalculatedAt).toLocaleDateString("uz-UZ")})</span>}
+                        {pendingPartners>0&&<span style={{...S.badge,background:"#FEF3C7",color:"#92400E"}}>⏳ {pendingPartners} ta hamkor fayli kutmoqda</span>}
                       </div>
                     </div>
                     <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
                       <button onClick={()=>toggleActive(test.id)} style={{...S.btnSmall,background:test.active?C.danger:C.success}}>{test.active?"⛔ To'xtatish":"✅ Faollashtirish"}</button>
                       <button onClick={()=>{setEditing(test);setCreating(false);}} style={{...S.btnSmall,background:C.primary}}>✏️ Tahrirlash</button>
                       <button onClick={()=>handleRegrade(test)} disabled={regradingId===test.id} style={{...S.btnSmall,background:regradingId===test.id?"#94A3B8":"#7C3AED"}}>{regradingId===test.id?"⏳ Baholanmoqda...":"🔄 Qayta baholash"}</button>
-                      <button onClick={()=>openRaschModal(test)} disabled={tr.length===0||raschBusyId===test.id} style={{...S.btnSmall,background:tr.length===0?"#CBD5E1":"#6D28D9",opacity:raschBusyId===test.id?0.6:1}}>{raschBusyId===test.id?"⏳ Hisoblanmoqda...":"🎯 Rash modeli"}</button>
+                      <button onClick={()=>openRaschModal(test)} disabled={(tr.length===0&&pendingPartners===0)||raschBusyId===test.id} style={{...S.btnSmall,background:(tr.length===0&&pendingPartners===0)?"#CBD5E1":"#6D28D9",opacity:raschBusyId===test.id?0.6:1}}>{raschBusyId===test.id?"⏳ Hisoblanmoqda...":"🎯 Rash modeli"}</button>
                       <button onClick={()=>setExportModal(buildExcelExport(test,results,users))} style={{...S.btnSmall,background:C.successDark}}>📥 Excel</button>
                       <button onClick={()=>triggerRaschUpload(test)} disabled={raschUploading} style={{...S.btnSmall,background:"#0891B2",opacity:raschUploading?0.6:1}}>{raschUploading&&raschUploadTarget?.id===test.id?"⏳ Yuklanmoqda...":"📤 Natija yuklash"}</button>
                       <button onClick={()=>deleteTest(test.id)} style={{...S.btnSmall,background:C.danger}}>🗑️</button>
@@ -3907,6 +4122,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
           <div>
             {/* Teacher manager — only full admin sees this */}
             {isFullAdmin && <TeacherManager />}
+            {isFullAdmin && <PartnerManager />}
             <h3 style={{marginBottom:16}}>O'quvchilar ({users.length})</h3>
             <div style={{overflowX:"auto"}}>
               <table style={S.table}>
@@ -4044,7 +4260,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
             {raschCalcRows&&raschCalcRows.length>0&&(
               <div style={{overflowX:"auto"}}>
                 <table style={S.table}>
-                  <thead><tr>{["#","F.I.O","Guruh","To'g'ri","Jami","Theta","Z-ball","BALL","Daraja"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                  <thead><tr>{["#","F.I.O","Guruh","To'g'ri","BALL","Daraja"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
                   <tbody>{[...raschCalcRows].sort((a,b)=>(b.ball??-999)-(a.ball??-999)).map((r,i)=>{
                     const dg=r.daraja; const dc=dg==="NC"?C.danger:(dg==="C"||dg==="C+")?C.warning:C.successDark;
                     return (
@@ -4053,9 +4269,6 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                         <td style={S.td}>{r.name}</td>
                         <td style={S.td}>{r.group||"-"}</td>
                         <td style={S.td}>{r.correct??"-"}</td>
-                        <td style={S.td}>{r.total??"-"}</td>
-                        <td style={S.td}>{r.theta!=null?r.theta.toFixed(3):"-"}</td>
-                        <td style={S.td}>{r.zBall!=null?r.zBall.toFixed(3):"-"}</td>
                         <td style={S.td}><b style={{color:"#6D28D9"}}>{r.ball!=null?r.ball.toFixed(1):"-"}</b></td>
                         <td style={S.td}>{dg?<span style={{...S.badge,background:dc+"22",color:dc,fontWeight:800}}>{dg}</span>:"-"}</td>
                       </tr>
@@ -4072,6 +4285,389 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
 }
 
 // ===== STUDENT DASHBOARD =====
+// ===== HAMKOR MARKAZ PANELI =====
+// Juda cheklangan: faqat testlar nomini ko'radi (tanlash uchun), Excel faylini
+// yuklaydi, va shu bitta amal — saytdagi natijalar bilan birgalikda Rash modeliga
+// qo'shiladi. O'quvchilar ro'yxati, boshqa hamkorlar, testlar tarkibi, statistika —
+// hech biri ko'rinmaydi.
+function PartnerPanel({ partnerInfo, onLogout }) {
+  const [tab, setTab] = useState("upload");
+  const [tests, setTests] = useState(() => db.get("tests") || []);
+  const [selectedTestId, setSelectedTestId] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const [err, setErr] = useState(null);
+  const fileInputRef = useRef(null);
+  const [uploads, setUploads] = useState(() => (db.get("partnerUploads")||[]).filter(u=>u.partnerId===partnerInfo?.id));
+  const [printBatch, setPrintBatch] = useState(null); // PDF (chop etish) uchun tanlangan yuklama
+  const [logo, setLogo] = useState(() => (db.get("partners")||[]).find(p=>p.id===partnerInfo?.id)?.logo || null);
+  const [logoErr, setLogoErr] = useState(null);
+  const logoInputRef = useRef(null);
+  const [docModal, setDocModal] = useState(null); // {type:"pdf"|"latex", url?, source?, name}
+  const [answersModal, setAnswersModal] = useState(null); // {test}
+
+  const reloadUploads = () => setUploads((db.get("partnerUploads")||[]).filter(u=>u.partnerId===partnerInfo?.id));
+
+  const handleLogoFile = (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file || !partnerInfo?.id) return;
+    if (!file.type.startsWith("image/")) { setLogoErr("Faqat rasm fayl (PNG/JPG) yuklang!"); return; }
+    if (file.size > 2*1024*1024) { setLogoErr("Rasm hajmi 2MB dan oshmasin!"); return; }
+    setLogoErr(null);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const dataUrl = ev.target.result;
+      db.set("partners", (db.get("partners")||[]).map(p=>p.id===partnerInfo.id?{...p,logo:dataUrl}:p));
+      setLogo(dataUrl);
+    };
+    reader.onerror = () => setLogoErr("Rasmni o'qishda xatolik yuz berdi.");
+    reader.readAsDataURL(file);
+  };
+  const removeLogo = () => {
+    db.set("partners", (db.get("partners")||[]).map(p=>p.id===partnerInfo.id?{...p,logo:null}:p));
+    setLogo(null);
+  };
+
+  const handleFile = (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file || !selectedTestId) return;
+    const test = tests.find(t => t.id === Number(selectedTestId) || t.id === selectedTestId);
+    if (!test) return;
+    if (!(test.active || test.everActivated)) { setErr("Bu test hali faollashtirilmagan — natija yuklab bo'lmaydi."); return; }
+    setBusy(true); setMsg(null); setErr(null);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const wb = XLSX.read(ev.target.result, { type: "array" });
+        const { rows } = parseUploadedResultsSheet(wb);
+        if (!rows.length) {
+          setErr("Faylda F.I.O / Ism ustuni topilmadi. Fayl tuzilishini tekshiring.");
+        } else {
+          // MUHIM: bu yerda Rash HISOBLANMAYDI — fayl faqat "kutilmoqda" holatida
+          // saqlanadi. Sayt va barcha hamkor markazlarning natijalari bir joyga
+          // yig'ilgach, admin/o'qituvchi "🎯 Rash modeli" tugmasini bosgandagina
+          // hammasi BIRGALIKDA bitta hisobga solinadi.
+          const batch = { id: Date.now(), partnerId: partnerInfo.id, testId: test.id, testName: test.name, uploadedAt: Date.now(), status: "pending", rawRows: rows, rows: rows };
+          const allUploads = [...(db.get("partnerUploads")||[]), batch];
+          db.set("partnerUploads", allUploads);
+          reloadUploads();
+          setMsg(`✅ Fayl qabul qilindi (${rows.length} ta o'quvchi) — "${test.name}" bo'yicha. Natija hozircha hisoblanmagan: admin yoki o'qituvchi barcha (sayt + hamkor markazlar) natijalarni birlashtirib Rash modelida hisoblagach, natijalaringizni "📊 Natijalarim" bo'limida ko'rasiz.`);
+        }
+      } catch {
+        setErr("Faylni o'qib bo'lmadi. .xlsx formatida ekanligini tekshiring.");
+      }
+      setBusy(false);
+    };
+    reader.onerror = () => { setBusy(false); setErr("Faylni o'qishda xatolik yuz berdi."); };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const printPDF = (batch) => {
+    setPrintBatch(batch);
+    setTimeout(() => { window.print(); setPrintBatch(null); }, 80);
+  };
+
+  // Statistika: barcha yuklamalar bo'yicha umumlashtirilgan ko'rsatkichlar
+  const allRows = uploads.flatMap(u => u.rows.map(r => ({ ...r, testName: u.testName })));
+  const withBall = allRows.filter(r => typeof r.ball === "number");
+  const avgBall = withBall.length ? (withBall.reduce((a,b)=>a+b.ball,0)/withBall.length) : null;
+  const darajaCounts = {};
+  withBall.forEach(r => { const d = r.daraja||"—"; darajaCounts[d] = (darajaCounts[d]||0)+1; });
+  const DARAJA_ORDER = ["NC","C","C+","B","B+","A","A+"];
+  const darajaColor = d => d==="NC"?C.danger:(d==="C"||d==="C+")?C.warning:C.successDark;
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg }}>
+      {/* Chop etish (PDF) uchun maxsus uslub — faqat #partner-print-area ko'rinadi */}
+      <style>{`
+        @media print {
+          body * { visibility: hidden; }
+          #partner-print-area, #partner-print-area * { visibility: visible; }
+          #partner-print-area { position: absolute; left: 0; top: 0; width: 100%; }
+        }
+      `}</style>
+      {printBatch && (
+        <div id="partner-print-area" style={{ padding: 24 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 4 }}>
+            {logo && <img src={logo} alt="logo" style={{ width: 48, height: 48, borderRadius: 8, objectFit: "cover" }}/>}
+            <h2 style={{ margin: 0 }}>{partnerInfo?.name}</h2>
+          </div>
+          <p style={{ margin: "0 0 4px", color: "#555" }}>Test: {printBatch.testName}</p>
+          <p style={{ margin: "0 0 16px", color: "#555" }}>Sana: {new Date(printBatch.uploadedAt).toLocaleDateString("uz-UZ")}</p>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead><tr>{["#","F.I.O","To'g'ri","BALL","Daraja"].map(h=>(
+              <th key={h} style={{ border: "1px solid #999", padding: "6px 8px", background: "#eee", textAlign: "left" }}>{h}</th>
+            ))}</tr></thead>
+            <tbody>{[...printBatch.rows].sort((a,b)=>(b.ball??-999)-(a.ball??-999)).map((r,i)=>(
+              <tr key={i}>
+                <td style={{ border: "1px solid #999", padding: "6px 8px" }}>{i+1}</td>
+                <td style={{ border: "1px solid #999", padding: "6px 8px" }}>{r.name}</td>
+                <td style={{ border: "1px solid #999", padding: "6px 8px" }}>{r.correct??"-"}/{r.total??"-"}</td>
+                <td style={{ border: "1px solid #999", padding: "6px 8px" }}>{r.ball!=null?r.ball.toFixed(1):"-"}</td>
+                <td style={{ border: "1px solid #999", padding: "6px 8px" }}>{r.daraja||"-"}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      )}
+
+      <div style={{ background: "linear-gradient(135deg,#0891B2,#0E7490)", padding: "18px 20px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div onClick={()=>logoInputRef.current?.click()} title="Logotipni o'zgartirish" style={{
+            width: 44, height: 44, borderRadius: 12, background: "rgba(255,255,255,0.15)",
+            display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer",
+            overflow: "hidden", flexShrink: 0, border: "1.5px solid rgba(255,255,255,0.35)",
+          }}>
+            {logo ? <img src={logo} alt="logo" style={{ width: "100%", height: "100%", objectFit: "cover" }}/> : <span style={{ fontSize: 22 }}>🤝</span>}
+          </div>
+          <input ref={logoInputRef} type="file" accept="image/*" onChange={handleLogoFile} style={{ display: "none" }}/>
+          <div>
+            <p style={{ margin: 0, color: "white", fontWeight: 800, fontSize: 17 }}>{partnerInfo?.name || "Hamkor markaz"}</p>
+            <p style={{ margin: 0, fontSize: 11.5 }}>
+              <span onClick={()=>logoInputRef.current?.click()} style={{ color: "rgba(255,255,255,0.85)", cursor: "pointer", textDecoration: "underline" }}>{logo ? "Logotipni o'zgartirish" : "Logotip yuklash"}</span>
+              {logo && <span onClick={removeLogo} style={{ color: "rgba(255,255,255,0.85)", cursor: "pointer", textDecoration: "underline", marginLeft: 8 }}>O'chirish</span>}
+            </p>
+          </div>
+        </div>
+        <button onClick={onLogout} style={{ background: "rgba(255,255,255,0.15)", border: "none", borderRadius: 10, color: "white", padding: "8px 14px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Chiqish</button>
+      </div>
+      {logoErr && <div style={{ background:"#FEF2F2", color:"#991B1B", padding:"8px 20px", fontSize:12.5, fontWeight:600 }}>⚠️ {logoErr}</div>}
+
+      <div style={{ display: "flex", background: "white", borderBottom: `1.5px solid ${C.border}` }}>
+        {[["upload","📤 Yuklash"],["view","🧾 Testlar"],["results","📊 Natijalarim"],["stats","📈 Statistika"]].map(([t,l])=>(
+          <button key={t} onClick={()=>{setTab(t); if(t!=="upload") reloadUploads();}} style={{
+            flex:1, padding:"13px 4px", background: tab===t?"#ECFEFF":"transparent",
+            border:"none", borderBottom: tab===t?"3px solid #0891B2":"3px solid transparent",
+            color: tab===t?"#0891B2":C.textMid, fontWeight: tab===t?800:600, fontSize:13, cursor:"pointer",
+          }}>{l}</button>
+        ))}
+      </div>
+
+      <div style={{ padding: 20, maxWidth: 560, margin: "0 auto" }}>
+
+        {tab==="upload" && (
+          <div style={{ ...S.card, padding: 18 }}>
+            <p style={{ margin: "0 0 14px", fontSize: 13, color: C.textMid, lineHeight: 1.6 }}>Tegishli testni tanlab, o'z markazingizning Excel natijalar faylini yuklaysiz. Natija shu testni saytda topshirganlar bilan birgalikda bitta Rash hisobida qayta hisoblanadi.</p>
+
+            <label style={S.label}>Test tanlang</label>
+            <select value={selectedTestId} onChange={e=>setSelectedTestId(e.target.value)} style={S.input}>
+              <option value="">— Testni tanlang —</option>
+              {tests.filter(t=>t.active||t.everActivated).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+            <p style={{margin:"-6px 0 12px",fontSize:11,color:C.textLight}}>Faqat kamida bir marta faollashtirilgan testlar ro'yxatda ko'rinadi.</p>
+
+            <button onClick={()=>fileInputRef.current?.click()} disabled={!selectedTestId || busy}
+              style={{ width: "100%", padding: "13px", borderRadius: 10, border: "none", cursor: (!selectedTestId||busy)?"not-allowed":"pointer",
+                background: (!selectedTestId||busy) ? "#CBD5E1" : "#0891B2", color: "white", fontWeight: 800, fontSize: 14, marginTop: 6 }}>
+              {busy ? "⏳ Yuklanmoqda..." : "📤 Excel faylni yuklash"}
+            </button>
+            <input ref={fileInputRef} type="file" accept=".xlsx,.xls" onChange={handleFile} style={{ display: "none" }}/>
+
+            {msg && <div style={{ marginTop: 14, padding: "12px 14px", borderRadius: 10, background: "#ECFDF5", color: "#065F46", fontSize: 13, fontWeight: 600, lineHeight: 1.5 }}>{msg}</div>}
+            {err && <div style={{ marginTop: 14, padding: "12px 14px", borderRadius: 10, background: "#FEF2F2", color: "#991B1B", fontSize: 13, fontWeight: 600 }}>⚠️ {err}</div>}
+          </div>
+        )}
+
+        {tab==="view" && (
+          <div>
+            <p style={{margin:"0 0 14px",fontSize:12.5,color:C.textLight,lineHeight:1.5}}>Testning savol variantini (PDF/LaTeX) faollashtirilgach ko'rishingiz mumkin, lekin uni topshira olmaysiz. Test tugagach (admin to'xtatgach), to'g'ri javoblar shu yerda ochiladi.</p>
+            {tests.length===0 && <div style={{...S.card,padding:24,textAlign:"center",color:C.textLight,fontSize:13}}>Hozircha testlar yo'q</div>}
+            {tests.map(test=>{
+              const langs = availableDocLangs(test);
+              const activated = !!(test.active || test.everActivated); // hech bo'lmasa bir marta faollashtirilganmi
+              // Vaqti tugagan bo'lsa ham (admin hali "to'xtatish" tugmasini bosmagan bo'lsa-da),
+              // test tugagan hisoblanadi — shunda javoblar ko'rinishi kerak.
+              const timeExpired = !!(test.startedAt && test.duration && Date.now() > test.startedAt + test.duration*60000);
+              const ended = activated && (!test.active || timeExpired);
+              return (
+                <div key={test.id} style={{...S.card,padding:16,marginBottom:12}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,flexWrap:"wrap"}}>
+                    <div>
+                      <h4 style={{margin:"0 0 3px",fontSize:14}}>{test.name}</h4>
+                      <p style={{margin:0,fontSize:11.5,color:C.textLight}}>{test.questions?.length||0} savol • {!activated?"⏸ Hali faollashtirilmagan":ended?"✅ Tugagan":"🟢 Faol"}</p>
+                    </div>
+                  </div>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:10}}>
+                    {!activated
+                      ? <span style={{...S.badge,background:"#F1F5F9",color:C.textLight,fontSize:11}}>Test hali faollashtirilmagan — ko'rish mumkin emas</span>
+                      : (langs.length>0
+                          ? <DocLangButtons test={test} onOpen={setDocModal} small/>
+                          : <span style={{fontSize:11.5,color:C.textLight}}>Bu testga hujjat (PDF/LaTeX) biriktirilmagan</span>)}
+                    {ended
+                      ? <button onClick={()=>setAnswersModal({test})} style={{...S.btnSmall,background:C.successDark,padding:"6px 12px",fontSize:12}}>✅ To'g'ri javoblar</button>
+                      : activated && <span style={{...S.badge,background:"#F1F5F9",color:C.textLight,fontSize:11}}>Javoblar test tugagach ochiladi</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {tab==="results" && (
+          <div>
+            {uploads.length===0 && <div style={{...S.card,padding:24,textAlign:"center",color:C.textLight,fontSize:13}}>Hali hech qanday fayl yuklanmagan</div>}
+            {uploads.slice().sort((a,b)=>b.uploadedAt-a.uploadedAt).map(batch=>{
+              const isPending = batch.status !== "processed";
+              const rows = batch.rows || batch.rawRows || [];
+              return (
+                <div key={batch.id} style={{...S.card,padding:16,marginBottom:14}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+                    <div>
+                      <h4 style={{margin:"0 0 2px",fontSize:14,color:"#0891B2"}}>{batch.testName}</h4>
+                      <p style={{margin:0,fontSize:11,color:C.textLight}}>{new Date(batch.uploadedAt).toLocaleString("uz-UZ")} • {rows.length} o'quvchi</p>
+                    </div>
+                    {isPending
+                      ? <span style={{...S.badge,background:"#FEF3C7",color:"#92400E",fontWeight:800}}>⏳ Hisoblanishi kutilmoqda</span>
+                      : <button onClick={()=>printPDF(batch)} style={{...S.btnSmall,background:"#0891B2",padding:"7px 12px",fontSize:12}}>📄 PDF qilib yuklab olish</button>}
+                  </div>
+                  {isPending && <p style={{margin:"0 0 10px",fontSize:12,color:"#92400E",background:"#FFFBEB",padding:"8px 10px",borderRadius:8}}>Bu fayl hali Rash modelida hisoblanmagan — admin yoki o'qituvchi barcha (sayt + hamkor markazlar) natijalarni birlashtirib hisoblashi kerak. Hisoblangach, shu yerda BALL va Daraja ko'rinadi.</p>}
+                  <div style={{overflowX:"auto"}}>
+                    <table style={S.table}>
+                      <thead><tr>{(isPending?["#","F.I.O","To'g'ri"]:["#","F.I.O","To'g'ri","BALL","Daraja"]).map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                      <tbody>{[...rows].sort((a,b)=>(b.ball??-999)-(a.ball??-999)).map((r,i)=>{
+                        const dc = darajaColor(r.daraja);
+                        return (
+                          <tr key={i} style={{background:i%2===0?C.card:"#FAFBFF"}}>
+                            <td style={S.td}>{i+1}</td>
+                            <td style={S.td}>{r.name}</td>
+                            <td style={S.td}>{r.correct??"-"}/{r.total??"-"}</td>
+                            {!isPending && <td style={S.td}><b style={{color:"#0891B2"}}>{r.ball!=null?r.ball.toFixed(1):"-"}</b></td>}
+                            {!isPending && <td style={S.td}>{r.daraja?<span style={{...S.badge,background:dc+"22",color:dc,fontWeight:800}}>{r.daraja}</span>:"-"}</td>}
+                          </tr>
+                        );
+                      })}</tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {tab==="stats" && (
+          <div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+              <div style={{...S.card,padding:16,textAlign:"center"}}>
+                <div style={{fontSize:28,fontWeight:900,color:"#0891B2"}}>{withBall.length}</div>
+                <div style={{fontSize:11.5,color:C.textMid}}>Jami o'quvchi</div>
+              </div>
+              <div style={{...S.card,padding:16,textAlign:"center"}}>
+                <div style={{fontSize:28,fontWeight:900,color:"#0891B2"}}>{avgBall!=null?avgBall.toFixed(1):"-"}</div>
+                <div style={{fontSize:11.5,color:C.textMid}}>O'rtacha BALL</div>
+              </div>
+            </div>
+            <div style={{...S.card,padding:16,marginBottom:16}}>
+              <p style={{margin:"0 0 12px",fontWeight:800,fontSize:13}}>Darajalar bo'yicha taqsimot</p>
+              {withBall.length===0
+                ? <p style={{color:C.textLight,fontSize:13,margin:0,textAlign:"center"}}>Ma'lumot yo'q</p>
+                : DARAJA_ORDER.filter(d=>darajaCounts[d]).map(d=>{
+                    const cnt = darajaCounts[d]||0;
+                    const pct = Math.round(cnt/withBall.length*100);
+                    const dc = darajaColor(d);
+                    return (
+                      <div key={d} style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                        <span style={{width:32,fontWeight:800,fontSize:12,color:dc}}>{d}</span>
+                        <div style={{flex:1,background:"#F1F5F9",borderRadius:6,height:16,overflow:"hidden"}}>
+                          <div style={{width:`${pct}%`,height:"100%",background:dc}}/>
+                        </div>
+                        <span style={{width:56,textAlign:"right",fontSize:12,color:C.textMid}}>{cnt} ({pct}%)</span>
+                      </div>
+                    );
+                  })
+              }
+            </div>
+            <div style={{...S.card,padding:16}}>
+              <p style={{margin:"0 0 10px",fontWeight:800,fontSize:13}}>Testlar bo'yicha</p>
+              {uploads.length===0
+                ? <p style={{color:C.textLight,fontSize:13,margin:0,textAlign:"center"}}>Ma'lumot yo'q</p>
+                : uploads.map(b=>{
+                    const bAvg = b.rows.filter(r=>typeof r.ball==="number");
+                    const avg = bAvg.length ? (bAvg.reduce((a,x)=>a+x.ball,0)/bAvg.length) : null;
+                    return (
+                      <div key={b.id} style={{display:"flex",justifyContent:"space-between",padding:"7px 0",borderTop:`1px solid ${C.border}`,fontSize:12.5}}>
+                        <span>{b.testName}</span>
+                        <span style={{color:C.textMid}}>{b.rows.length} ta • o'rt. {avg!=null?avg.toFixed(1):"-"}</span>
+                      </div>
+                    );
+                  })
+              }
+            </div>
+          </div>
+        )}
+
+      </div>
+
+      {/* Test hujjatini (PDF/LaTeX) ko'rish — faqat ko'rish, topshirish yo'q */}
+      {docModal&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",flexDirection:"column"}}>
+          <div style={{background:C.card,padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:`1px solid ${C.border}`}}>
+            <span style={{fontWeight:700,fontSize:16}}>{docModal.type==="pdf"?"📄":"∑"} {docModal.name||"Test varianti"}</span>
+            <button onClick={()=>setDocModal(null)} style={{...S.btnDanger,padding:"8px 14px"}}>✕ Yopish</button>
+          </div>
+          {docModal.type==="pdf"
+            ? <PdfViewer url={docModal.url} persistKey={"partner_pdf_"+docModal.url?.slice(-8)}/>
+            : <ScrollPersistDiv persistKey={"partner_latex_scroll_"+(docModal.id||"x")} style={{flex:1,overflowY:"auto",background:"white"}}><LatexDocViewer source={docModal.source} images={docModal.images}/></ScrollPersistDiv>
+          }
+        </div>
+      )}
+
+      {/* Test tugagandan keyin — to'g'ri javoblar */}
+      {answersModal&&(()=>{
+        const test = answersModal.test;
+        const closedQs = test.questions.filter(q=>q.type==="closed");
+        const openQs = test.questions.filter(q=>q.type==="open");
+        return (
+          <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",flexDirection:"column"}}>
+            <div style={{background:C.successDark,padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{fontWeight:700,fontSize:15,color:"white"}}>✅ To'g'ri javoblar: {test.name}</span>
+              <button onClick={()=>setAnswersModal(null)} style={{...S.btnSmall,background:"rgba(255,255,255,0.2)",color:"white"}}>✕ Yopish</button>
+            </div>
+            <div style={{flex:1,overflowY:"auto",background:C.bg,padding:16}}>
+              {closedQs.length>0&&(
+                <div style={{...S.card,padding:16,marginBottom:14}}>
+                  <h4 style={{margin:"0 0 10px",color:C.primary,fontSize:14}}>Yopiq savollar</h4>
+                  <div style={{overflowX:"auto"}}>
+                    <table style={S.table}>
+                      <thead><tr>{["#","To'g'ri javob"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                      <tbody>{closedQs.map((q,i)=>(
+                        <tr key={i} style={{background:i%2===0?C.card:"#FAFBFF"}}>
+                          <td style={S.td}>{i+1}</td>
+                          <td style={{...S.td,fontWeight:700,color:C.successDark}}>{q.correctAnswer||"—"}</td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              {openQs.map((q,ri)=>{
+                const idx = closedQs.length+ri;
+                return (
+                  <div key={idx} style={{...S.card,padding:16,marginBottom:12}}>
+                    <h4 style={{margin:"0 0 10px",color:C.warning,fontSize:14}}>Savol {idx+1}</h4>
+                    {q.subParts?.length>0
+                      ? q.subParts.map((sp,si)=>(
+                          <div key={si} style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",padding:"8px 10px",borderRadius:8,background:C.successLight,marginBottom:6}}>
+                            <span style={{color:C.warning,fontWeight:700,minWidth:34}}>{idx+1}{sp.label})</span>
+                            <KatexSpan latex={toLatex(sp.answer||"")} fontSize={17}/>
+                          </div>
+                        ))
+                      : <div style={{padding:"8px 10px",borderRadius:8,background:C.successLight}}><KatexSpan latex={toLatex(q.correctAnswer||"")} fontSize={17}/></div>
+                    }
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
+
+    </div>
+  );
+}
+
+
 function StudentDashboard({ user, onLogout }) {
   const [tab,setTab]=useState("tests");
   const [tests,setTests]=useState([]); const [results,setResults]=useState([]);
@@ -4948,19 +5544,24 @@ export default function App() {
   // (masalan boshqa qurilmada tahrirlangan bo'lishi mumkin).
   const initFromSession = () => {
     const s = loadSession();
-    if (!s) return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null };
-    if (s.role === "admin") return { page: "admin", user: null, isAdmin: true, isTeacher: false, teacherInfo: null };
+    if (!s) return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null, isPartner: false, partnerInfo: null };
+    if (s.role === "admin") return { page: "admin", user: null, isAdmin: true, isTeacher: false, teacherInfo: null, isPartner: false, partnerInfo: null };
     if (s.role === "teacher") {
       const t = (db.get("teachers")||[]).find(x => x.id === s.teacherId);
-      if (!t) { clearSession(); return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null }; }
-      return { page: "teacher", user: null, isAdmin: false, isTeacher: true, teacherInfo: t };
+      if (!t) { clearSession(); return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null, isPartner: false, partnerInfo: null }; }
+      return { page: "teacher", user: null, isAdmin: false, isTeacher: true, teacherInfo: t, isPartner: false, partnerInfo: null };
+    }
+    if (s.role === "partner") {
+      const p = (db.get("partners")||[]).find(x => x.id === s.partnerId);
+      if (!p || !p.approved) { clearSession(); return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null, isPartner: false, partnerInfo: null }; }
+      return { page: "partner", user: null, isAdmin: false, isTeacher: false, teacherInfo: null, isPartner: true, partnerInfo: p };
     }
     if (s.role === "student") {
       const u = (db.get("users")||[]).find(x => x.phone === s.phone);
-      if (!u) { clearSession(); return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null }; }
-      return { page: "student", user: u, isAdmin: false, isTeacher: false, teacherInfo: null };
+      if (!u) { clearSession(); return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null, isPartner: false, partnerInfo: null }; }
+      return { page: "student", user: u, isAdmin: false, isTeacher: false, teacherInfo: null, isPartner: false, partnerInfo: null };
     }
-    return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null };
+    return { page: "login", user: null, isAdmin: false, isTeacher: false, teacherInfo: null, isPartner: false, partnerInfo: null };
   };
   const initState = initFromSession();
   const [page,setPage]=useState(initState.page);
@@ -4968,6 +5569,8 @@ export default function App() {
   const [isAdmin,setIsAdmin]=useState(initState.isAdmin);
   const [isTeacher,setIsTeacher]=useState(initState.isTeacher);
   const [teacherInfo,setTeacherInfo]=useState(initState.teacherInfo);
+  const [isPartner,setIsPartner]=useState(initState.isPartner);
+  const [partnerInfo,setPartnerInfo]=useState(initState.partnerInfo);
   const [showSplash,setShowSplash]=useState(true);
   useEffect(()=>{
     initDB();
@@ -4996,8 +5599,10 @@ export default function App() {
   if(showSplash) return <SplashScreen onDone={()=>setShowSplash(false)}/>;
   if(page==="admin"&&isAdmin) return <AdminPanel isFullAdmin={true} onLogout={()=>{setIsAdmin(false);setPage("login");clearSession();}}/>;
   if(page==="teacher"&&isTeacher) return <AdminPanel isFullAdmin={false} teacherInfo={teacherInfo} onLogout={()=>{setIsTeacher(false);setTeacherInfo(null);setPage("login");clearSession();}}/>;
+  if(page==="partner"&&isPartner) return <PartnerPanel partnerInfo={partnerInfo} onLogout={()=>{setIsPartner(false);setPartnerInfo(null);setPage("login");clearSession();}}/>;
   if(page==="student"&&user) return <StudentDashboard user={user} onLogout={()=>{setUser(null);setPage("login");clearSession();}}/>;
   if(page==="register") return <RegisterPage onDone={u=>{setUser(u);setPage("student");saveSession({role:"student",phone:u.phone});}} onLogin={()=>setPage("login")}/>;
+  if(page==="partnerRegister") return <PartnerRegisterPage onLogin={()=>setPage("login")}/>;
   return <LoginPage
     onLogin={u=>{setUser(u);setPage("student");saveSession({role:"student",phone:u.phone});}}
     onRegister={()=>setPage("register")}
@@ -5005,5 +5610,7 @@ export default function App() {
       if(fullAdmin){ setIsAdmin(true); setPage("admin"); saveSession({role:"admin"}); }
       else { setIsTeacher(true); setTeacherInfo(teacher); setPage("teacher"); saveSession({role:"teacher",teacherId:teacher.id}); }
     }}
+    onPartner={(partner)=>{ setIsPartner(true); setPartnerInfo(partner); setPage("partner"); saveSession({role:"partner",partnerId:partner.id}); }}
+    onPartnerRegister={()=>setPage("partnerRegister")}
   />;
 }
