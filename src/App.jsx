@@ -775,7 +775,7 @@ const FIREBASE_CONFIG = {
   messagingSenderId: "109909968975",
   appId: "1:109909968975:web:7b5c4ba4a80a54085ac23a",
 };
-const FIREBASE_SYNC_COLLECTIONS = ["users", "tests", "results"];
+const FIREBASE_SYNC_COLLECTIONS = ["users", "tests", "results", "teachers", "partners", "partnerUploads"];
 
 let fbApp = null, fbFirestore = null, fbSdkLoading = false, fbListenersReady = false;
 function isFirebaseConfigured() { return !!(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.projectId); }
@@ -1578,6 +1578,12 @@ function testTotalItems(test) {
   let n = 0;
   for (const q of test.questions || []) n += q.subParts?.length > 0 ? q.subParts.length : 1;
   return n;
+}
+// Rash modeli faqat aynan 55 ta savol/banddan iborat testlar uchun ishlaydi (shablon shu
+// formatga mo'ljallangan). Boshqa sondagi testlar Rash bo'yicha yuklanmaydi/hisoblanmaydi.
+const RASCH_REQUIRED_ITEMS = 55;
+function testEligibleForRasch(test) {
+  return testTotalItems(test) === RASCH_REQUIRED_ITEMS;
 }
 // Rash modeli logit (qobiliyat) qiymati: to'g'ri javoblar sonini 0.5..total-0.5 oralig'ida
 // "clamp" qilib (0% yoki 100% cheksizlikka aylanib qolmasligi uchun), logit-ga aylantiradi.
@@ -3548,7 +3554,7 @@ function TestCreator({ existing, onSave, onCancel }) {
               <div key={sec} style={{marginBottom:16}}>
                 <div style={{background:C.primaryLight,borderRadius:8,padding:"8px 14px",marginBottom:8,display:"flex",justifyContent:"space-between"}}>
                   <span style={{color:C.primary,fontWeight:700,fontSize:14}}>📚 {sec}</span>
-                  <span style={{color:C.textMid,fontSize:12}}>{items.length} savol</span>
+                  <span style={{color:C.textMid,fontSize:12}}>{items.reduce((s,{q})=>s+(q.subParts?.length>0?q.subParts.length:1),0)} savol</span>
                 </div>
                 {items.map(({q,i})=>(
                   <div key={i} style={{...S.card,marginBottom:7,padding:"11px 13px"}}>
@@ -3869,6 +3875,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
     if (!raschCalcRawRows || !raschCalcAttachTestId) return;
     const test = tests.find(t=>t.id===Number(raschCalcAttachTestId) || t.id===raschCalcAttachTestId);
     if (!test) return;
+    if (!testEligibleForRasch(test)) { setRaschDoneMsg(`⚠️ "${test.name}" — Rash modeli faqat aynan ${RASCH_REQUIRED_ITEMS} ta savol/banddan iborat testlar uchun ishlaydi.`); setTimeout(()=>setRaschDoneMsg(null),6000); return; }
     setRaschCalcAttaching(true);
     setTimeout(() => {
       const settings = raschCalcSettings;
@@ -3883,12 +3890,16 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
     }, 30);
   };
 
-  const triggerRaschUpload = (test) => { setRaschUploadTarget(test); requestAnimationFrame(()=>raschFileInputRef.current?.click()); };
+  const triggerRaschUpload = (test) => {
+    if (!testEligibleForRasch(test)) { setRaschDoneMsg(`⚠️ "${test.name}" — Rash modeli faqat aynan ${RASCH_REQUIRED_ITEMS} ta savol/banddan iborat testlar uchun ishlaydi. Bu testda ${testTotalItems(test)} ta bor, shuning uchun fayl yuklab bo'lmaydi.`); setTimeout(()=>setRaschDoneMsg(null),6000); return; }
+    setRaschUploadTarget(test); requestAnimationFrame(()=>raschFileInputRef.current?.click());
+  };
   const handleRaschFile = (e) => {
     const file = e.target.files[0];
     e.target.value = "";
     if (!file || !raschUploadTarget) return;
     const test = raschUploadTarget;
+    if (!testEligibleForRasch(test)) { setRaschDoneMsg(`⚠️ "${test.name}" — ${RASCH_REQUIRED_ITEMS} talik test emas, Rashda hisoblanmaydi.`); setRaschUploadTarget(null); setTimeout(()=>setRaschDoneMsg(null),6000); return; }
     setRaschUploading(true);
     const reader = new FileReader();
     reader.onload = (ev) => {
@@ -3919,6 +3930,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
   };
 
   const openRaschModal = (test) => {
+    if (!testEligibleForRasch(test)) { setRaschDoneMsg(`⚠️ "${test.name}" — Rash modeli faqat aynan ${RASCH_REQUIRED_ITEMS} ta savol/banddan iborat testlar uchun ishlaydi. Bu testda ${testTotalItems(test)} ta bor.`); setTimeout(()=>setRaschDoneMsg(null),6000); return; }
     setRaschModal({ test, settings: { ...(test.raschSettings || DEFAULT_RASCH_SETTINGS) } });
   };
   const runRasch = () => {
@@ -4083,7 +4095,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:10}}>
                     <div>
                       <h4 style={{margin:"0 0 5px",fontSize:16}}>{test.name}</h4>
-                      <p style={{margin:"0 0 8px",color:C.textMid,fontSize:13}}>{test.questions?.length} savol • {test.duration} daqiqa</p>
+                      <p style={{margin:"0 0 8px",color:C.textMid,fontSize:13}}>{testTotalItems(test)} savol • {test.duration} daqiqa</p>
                       <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
                         <span style={{...S.badge,background:test.active?C.successLight:C.dangerLight,color:test.active?C.successDark:C.danger}}>{test.active?"✅ Faol":"⛔ Nofaol"}</span>
                         <span style={{...S.badge,background:C.primaryLight,color:C.primary}}>{tr.length} topshirdi</span>
@@ -4105,9 +4117,9 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                       <button onClick={()=>toggleActive(test.id)} style={{...S.btnSmall,background:test.active?C.danger:C.success}}>{test.active?"⛔ To'xtatish":"✅ Faollashtirish"}</button>
                       <button onClick={()=>{setEditing(test);setCreating(false);}} style={{...S.btnSmall,background:C.primary}}>✏️ Tahrirlash</button>
                       <button onClick={()=>handleRegrade(test)} disabled={regradingId===test.id} style={{...S.btnSmall,background:regradingId===test.id?"#94A3B8":"#7C3AED"}}>{regradingId===test.id?"⏳ Baholanmoqda...":"🔄 Qayta baholash"}</button>
-                      <button onClick={()=>openRaschModal(test)} disabled={(tr.length===0&&pendingPartners===0)||raschBusyId===test.id} style={{...S.btnSmall,background:(tr.length===0&&pendingPartners===0)?"#CBD5E1":"#6D28D9",opacity:raschBusyId===test.id?0.6:1}}>{raschBusyId===test.id?"⏳ Hisoblanmoqda...":"🎯 Rash modeli"}</button>
+                      <button onClick={()=>openRaschModal(test)} disabled={!testEligibleForRasch(test)||(tr.length===0&&pendingPartners===0)||raschBusyId===test.id} title={!testEligibleForRasch(test)?`Faqat ${RASCH_REQUIRED_ITEMS} talik testlar uchun`:undefined} style={{...S.btnSmall,background:(!testEligibleForRasch(test)||(tr.length===0&&pendingPartners===0))?"#CBD5E1":"#6D28D9",opacity:raschBusyId===test.id?0.6:1}}>{raschBusyId===test.id?"⏳ Hisoblanmoqda...":"🎯 Rash modeli"}</button>
                       <button onClick={()=>setExportModal(buildExcelExport(test,results,users))} style={{...S.btnSmall,background:C.successDark}}>📥 Excel</button>
-                      <button onClick={()=>triggerRaschUpload(test)} disabled={raschUploading} style={{...S.btnSmall,background:"#0891B2",opacity:raschUploading?0.6:1}}>{raschUploading&&raschUploadTarget?.id===test.id?"⏳ Yuklanmoqda...":"📤 Natija yuklash"}</button>
+                      <button onClick={()=>triggerRaschUpload(test)} disabled={!testEligibleForRasch(test)||raschUploading} title={!testEligibleForRasch(test)?`Faqat ${RASCH_REQUIRED_ITEMS} talik testlar uchun`:undefined} style={{...S.btnSmall,background:!testEligibleForRasch(test)?"#CBD5E1":"#0891B2",opacity:raschUploading?0.6:1}}>{raschUploading&&raschUploadTarget?.id===test.id?"⏳ Yuklanmoqda...":"📤 Natija yuklash"}</button>
                       <button onClick={()=>deleteTest(test.id)} style={{...S.btnSmall,background:C.danger}}>🗑️</button>
                     </div>
                   </div>
@@ -4179,9 +4191,9 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
                     <h4 style={{margin:0,color:C.primary}}>{test.name}</h4>
                     <div style={{display:"flex",gap:8}}>
-                      <button onClick={()=>openRaschModal(test)} disabled={raschBusyId===test.id} style={{...S.btnSmall,background:"#6D28D9",opacity:raschBusyId===test.id?0.6:1}}>{raschBusyId===test.id?"⏳...":"🎯 Rash modeli"}</button>
+                      <button onClick={()=>openRaschModal(test)} disabled={!testEligibleForRasch(test)||raschBusyId===test.id} title={!testEligibleForRasch(test)?`Faqat ${RASCH_REQUIRED_ITEMS} talik testlar uchun`:undefined} style={{...S.btnSmall,background:!testEligibleForRasch(test)?"#CBD5E1":"#6D28D9",opacity:raschBusyId===test.id?0.6:1}}>{raschBusyId===test.id?"⏳...":"🎯 Rash modeli"}</button>
                       <button onClick={()=>setExportModal(buildExcelExport(test,results,users))} style={{...S.btnSmall,background:C.successDark}}>📥 Excel</button>
-                      <button onClick={()=>triggerRaschUpload(test)} disabled={raschUploading} style={{...S.btnSmall,background:"#0891B2",opacity:raschUploading?0.6:1}}>{raschUploading&&raschUploadTarget?.id===test.id?"⏳...":"📤 Natija yuklash"}</button>
+                      <button onClick={()=>triggerRaschUpload(test)} disabled={!testEligibleForRasch(test)||raschUploading} title={!testEligibleForRasch(test)?`Faqat ${RASCH_REQUIRED_ITEMS} talik testlar uchun`:undefined} style={{...S.btnSmall,background:!testEligibleForRasch(test)?"#CBD5E1":"#0891B2",opacity:raschUploading?0.6:1}}>{raschUploading&&raschUploadTarget?.id===test.id?"⏳...":"📤 Natija yuklash"}</button>
                     </div>
                   </div>
                   <div style={{overflowX:"auto"}}>
@@ -4189,7 +4201,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                       <thead><tr>{["#","F.I.O","Guruh","Ball","Foiz","Rash ball","Daraja","Vaqt","Sana"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
                       <tbody>{tr.sort((a,b)=>b.totalScore-a.totalScore).map((r,i)=>{
                         const u=users.find(u=>u.phone===r.userPhone);
-                        const pct=Math.round((r.totalScore/test.questions.length)*100);
+                        const pct=Math.round((r.totalScore/testTotalItems(test))*100);
                         const dGrade=r.rasch?.daraja;
                         const dColor=dGrade==="NC"?C.danger:dGrade==="C"||dGrade==="C+"?C.warning:C.successDark;
                         return (
@@ -4197,7 +4209,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                             <td style={S.td}>{i+1}</td>
                             <td style={S.td}>{u?`${u.firstName} ${u.lastName}`:r.userPhone}</td>
                             <td style={S.td}>{u?.group||"-"}</td>
-                            <td style={S.td}><b style={{color:pct>=70?C.successDark:pct>=50?C.warning:C.danger}}>{r.totalScore}</b>/{test.questions.length}</td>
+                            <td style={S.td}><b style={{color:pct>=70?C.successDark:pct>=50?C.warning:C.danger}}>{r.totalScore}</b>/{testTotalItems(test)}</td>
                             <td style={S.td}><span style={{color:pct>=70?C.successDark:pct>=50?C.warning:C.danger,fontWeight:700}}>{pct}%</span></td>
                             <td style={S.td}>{r.rasch?<b style={{color:"#6D28D9"}}>{r.rasch.ball.toFixed(1)}</b>:<span style={{color:C.textLight}}>—</span>}</td>
                             <td style={S.td}>{dGrade?<span style={{...S.badge,background:dColor+"22",color:dColor,fontWeight:800}}>{dGrade}</span>:<span style={{color:C.textLight}}>—</span>}</td>
@@ -4249,11 +4261,11 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                 <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>
                   <select value={raschCalcAttachTestId} onChange={e=>setRaschCalcAttachTestId(e.target.value)} style={{...S.input,marginBottom:0,maxWidth:320,flex:"1 1 240px"}}>
                     <option value="">— Testni tanlang —</option>
-                    {tests.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
+                    {tests.filter(t=>testEligibleForRasch(t)).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}
                   </select>
                   <button onClick={attachRaschCalcToTest} disabled={!raschCalcAttachTestId||raschCalcAttaching} style={{...S.btnSmall,background:raschCalcAttachTestId?"#6D28D9":"#CBD5E1",padding:"11px 20px",fontSize:13,opacity:raschCalcAttaching?0.6:1}}>{raschCalcAttaching?"⏳ Saqlanmoqda...":"💾 Ushbu testga saqlash"}</button>
                 </div>
-                <p style={{margin:"8px 0 0",fontSize:11,color:C.textLight}}>Tanlangan test bo'yicha saytda topshirganlar + shu fayl birgalikda bitta Rash hisobida qayta hisoblanadi va mos o'quvchilarning profiliga yoziladi.</p>
+                <p style={{margin:"8px 0 0",fontSize:11,color:C.textLight}}>Tanlangan test bo'yicha saytda topshirganlar + shu fayl birgalikda bitta Rash hisobida qayta hisoblanadi va mos o'quvchilarning profiliga yoziladi. Faqat aynan {RASCH_REQUIRED_ITEMS} talik testlar ro'yxatda ko'rinadi.</p>
               </div>
             )}
 
@@ -4336,6 +4348,7 @@ function PartnerPanel({ partnerInfo, onLogout }) {
     const test = tests.find(t => t.id === Number(selectedTestId) || t.id === selectedTestId);
     if (!test) return;
     if (!(test.active || test.everActivated)) { setErr("Bu test hali faollashtirilmagan — natija yuklab bo'lmaydi."); return; }
+    if (!testEligibleForRasch(test)) { setErr(`Rash modeli faqat aynan ${RASCH_REQUIRED_ITEMS} ta savol/banddan iborat testlar uchun ishlaydi. Bu testda ${testTotalItems(test)} ta bor, shuning uchun fayl yuklab bo'lmaydi.`); return; }
     setBusy(true); setMsg(null); setErr(null);
     const reader = new FileReader();
     reader.onload = (ev) => {
@@ -4454,9 +4467,9 @@ function PartnerPanel({ partnerInfo, onLogout }) {
             <label style={S.label}>Test tanlang</label>
             <select value={selectedTestId} onChange={e=>setSelectedTestId(e.target.value)} style={S.input}>
               <option value="">— Testni tanlang —</option>
-              {tests.filter(t=>t.active||t.everActivated).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+              {tests.filter(t=>(t.active||t.everActivated)&&testEligibleForRasch(t)).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
             </select>
-            <p style={{margin:"-6px 0 12px",fontSize:11,color:C.textLight}}>Faqat kamida bir marta faollashtirilgan testlar ro'yxatda ko'rinadi.</p>
+            <p style={{margin:"-6px 0 12px",fontSize:11,color:C.textLight}}>Faqat kamida bir marta faollashtirilgan VA aynan {RASCH_REQUIRED_ITEMS} ta savol/banddan iborat testlar ro'yxatda ko'rinadi.</p>
 
             <button onClick={()=>fileInputRef.current?.click()} disabled={!selectedTestId || busy}
               style={{ width: "100%", padding: "13px", borderRadius: 10, border: "none", cursor: (!selectedTestId||busy)?"not-allowed":"pointer",
@@ -4486,7 +4499,7 @@ function PartnerPanel({ partnerInfo, onLogout }) {
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10,flexWrap:"wrap"}}>
                     <div>
                       <h4 style={{margin:"0 0 3px",fontSize:14}}>{test.name}</h4>
-                      <p style={{margin:0,fontSize:11.5,color:C.textLight}}>{test.questions?.length||0} savol • {!activated?"⏸ Hali faollashtirilmagan":ended?"✅ Tugagan":"🟢 Faol"}</p>
+                      <p style={{margin:0,fontSize:11.5,color:C.textLight}}>{testTotalItems(test)} savol • {!activated?"⏸ Hali faollashtirilmagan":ended?"✅ Tugagan":"🟢 Faol"}</p>
                     </div>
                   </div>
                   <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:10}}>
@@ -4788,7 +4801,7 @@ function StudentDashboard({ user, onLogout }) {
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
                       <div>
                         <h4 style={{margin:"0 0 5px",fontSize:16}}>{test.name}</h4>
-                        <p style={{margin:"0 0 6px",color:C.textMid,fontSize:13}}>{test.questions?.length} savol • {test.duration} daqiqa</p>
+                        <p style={{margin:"0 0 6px",color:C.textMid,fontSize:13}}>{testTotalItems(test)} savol • {test.duration} daqiqa</p>
                         <span style={{...S.badge,background:C.primaryLight,color:C.primary}}>📅 Boshlanadi: {formatScheduled(test.scheduledAt)}</span>
                       </div>
                       <div style={{textAlign:"right"}}>
@@ -4814,7 +4827,7 @@ function StudentDashboard({ user, onLogout }) {
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
                     <div>
                       <h4 style={{margin:"0 0 5px",fontSize:16}}>{test.name}</h4>
-                      <p style={{margin:"0 0 6px",color:C.textMid,fontSize:13}}>{test.questions?.length} savol • {test.duration} daqiqa</p>
+                      <p style={{margin:"0 0 6px",color:C.textMid,fontSize:13}}>{testTotalItems(test)} savol • {test.duration} daqiqa</p>
                       <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
                         {timeInfo&&<span style={{...S.badge,background:expired?C.dangerLight:C.warningLight,color:expired?C.danger:C.warning,fontSize:12}}>⏱ {timeInfo}</span>}
                         <DocLangButtons test={test} onOpen={setDocModal} small/>
@@ -4823,7 +4836,7 @@ function StudentDashboard({ user, onLogout }) {
                     {myRes?(
                       <div style={{textAlign:"right"}}>
                         <p style={{margin:"0 0 4px",color:C.successDark,fontWeight:700}}>✅ Topshirildi</p>
-                        <p style={{margin:0,color:C.textMid,fontSize:13}}>{myRes.totalScore}/{test.questions?.length} ball</p>
+                        <p style={{margin:0,color:C.textMid,fontSize:13}}>{myRes.totalScore}/{testTotalItems(test)} ball</p>
                       </div>
                     ):expired?(
                       <span style={{color:C.danger,fontWeight:700,fontSize:13}}>⛔ Vaqti o'tdi</span>
@@ -4843,7 +4856,7 @@ function StudentDashboard({ user, onLogout }) {
             {results.map(r=>{
               const test=(db.get("tests")||[]).find(t=>t.id===r.testId);
               if(!test) return null;
-              const pct=Math.round((r.totalScore/test.questions.length)*100);
+              const pct=Math.round((r.totalScore/testTotalItems(test))*100);
               const canView=test.showAnswersAfter==="immediate"||r.canViewAnswers;
               return (
                 <div key={r.id} style={{...S.card,padding:18,marginBottom:12}}>
@@ -4853,7 +4866,7 @@ function StudentDashboard({ user, onLogout }) {
                         return <p style={{margin:"5px 0 0",display:"inline-flex",alignItems:"center",gap:6}}><span style={{fontSize:11,color:C.textMid}}>🎯 Rash:</span><b style={{color:"#6D28D9",fontSize:13}}>{r.rasch.ball.toFixed(1)}</b><span style={{background:dc+"22",color:dc,padding:"2px 8px",borderRadius:6,fontSize:11,fontWeight:800}}>{dg}</span></p>; })()}
                     </div>
                     <div style={{textAlign:"right"}}>
-                      <p style={{margin:"0 0 4px",fontWeight:800,fontSize:20,color:pct>=70?C.successDark:pct>=50?C.warning:C.danger}}>{r.totalScore}<span style={{color:C.textMid,fontWeight:400,fontSize:14}}>/{test.questions.length}</span></p>
+                      <p style={{margin:"0 0 4px",fontWeight:800,fontSize:20,color:pct>=70?C.successDark:pct>=50?C.warning:C.danger}}>{r.totalScore}<span style={{color:C.textMid,fontWeight:400,fontSize:14}}>/{testTotalItems(test)}</span></p>
                       {canView?<button onClick={()=>setViewResult(r)} style={{...S.btnSmall,background:C.primary,padding:"6px 14px",fontSize:12}}>Xatolarni Ko'rish</button>:<span style={{color:C.warning,fontSize:12}}>⏳ Keyinroq</span>}
                     </div>
                   </div>
@@ -4877,7 +4890,7 @@ function StudentDashboard({ user, onLogout }) {
                   <div style={{width:44,height:44,borderRadius:10,background:C.primaryLight,display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,flexShrink:0}}>📄</div>
                   <div>
                     <h4 style={{margin:"0 0 2px",fontSize:15}}>{test.name}</h4>
-                    <p style={{margin:0,color:C.textMid,fontSize:12}}>{test.questions?.length} savol • {availableDocLangs(test).map(l=>l.label).join(" / ")}</p>
+                    <p style={{margin:0,color:C.textMid,fontSize:12}}>{testTotalItems(test)} savol • {availableDocLangs(test).map(l=>l.label).join(" / ")}</p>
                   </div>
                 </div>
                 <div style={{display:"flex",gap:8,flexWrap:"wrap"}}><DocLangButtons test={test} onOpen={setDocModal}/></div>
@@ -5379,7 +5392,7 @@ function TestTaking({ test, user, onFinish, onExit }) {
 // ===== RESULT DETAIL =====
 function ResultDetail({ result, test, onBack }) {
   if(!test) return <div style={{padding:24}}><button onClick={onBack}>← Orqaga</button> Test topilmadi.</div>;
-  const pct=Math.round((result.totalScore/test.questions.length)*100);
+  const pct=Math.round((result.totalScore/testTotalItems(test))*100);
   const closedQs=test.questions.filter(q=>q.type==="closed");
   return (
     <div style={S.page}>
@@ -5390,7 +5403,7 @@ function ResultDetail({ result, test, onBack }) {
       <div style={{padding:20,maxWidth:800,margin:"0 auto"}}>
         <div style={{...S.card,padding:24,textAlign:"center",marginBottom:20}}>
           <div style={{fontSize:72,fontWeight:900,color:pct>=70?C.successDark:pct>=50?C.warning:C.danger,lineHeight:1}}>{result.totalScore}</div>
-          <div style={{color:C.textMid,fontSize:18,margin:"4px 0 12px"}}>/ {test.questions.length} ball ({pct}%)</div>
+          <div style={{color:C.textMid,fontSize:18,margin:"4px 0 12px"}}>/ {testTotalItems(test)} ball ({pct}%)</div>
           <div style={{background:C.bg,borderRadius:999,height:14,overflow:"hidden",maxWidth:400,margin:"0 auto"}}>
             <div style={{width:`${pct}%`,height:"100%",background:pct>=70?C.success:pct>=50?C.warning:C.danger,borderRadius:999,transition:"width 1.5s"}}/>
           </div>
@@ -5614,4 +5627,3 @@ export default function App() {
     onPartnerRegister={()=>setPage("partnerRegister")}
   />;
 }
-
