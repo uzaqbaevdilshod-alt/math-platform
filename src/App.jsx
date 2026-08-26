@@ -1050,6 +1050,8 @@ function processExpr(s) {
         const cm = topLevelComma(inner);
         const base = cm >= 0 ? inner.slice(0, cm) : inner;
         const exp  = cm >= 0 ? inner.slice(cm + 1) : "";
+        const lastChSup = result.slice(-1);
+        if (lastChSup && /[\d)]/.test(lastChSup)) result += "*";
         result += "(" + (processExpr(base) || "0") + ")^(" + (processExpr(exp) || "1") + ")";
         i = cl + 1; continue;
       }
@@ -1062,6 +1064,8 @@ function processExpr(s) {
         const cm = topLevelComma(inner);
         const deg = cm >= 0 ? inner.slice(0, cm) : "2";
         const arg = cm >= 0 ? inner.slice(cm + 1) : inner;
+        const lastChRoot = result.slice(-1);
+        if (lastChRoot && /[\d)]/.test(lastChRoot)) result += "*";
         result += "nthRoot(" + processExpr(arg) + "," + deg + ")";
         i = cl + 1; continue;
       }
@@ -1099,6 +1103,8 @@ function processExpr(s) {
     if (s[i] === "|") {
       const cl = s.indexOf("|", i + 1);
       if (cl !== -1) {
+        const lastChAbs = result.slice(-1);
+        if (lastChAbs && /[\d)]/.test(lastChAbs)) result += "*";
         result += "abs(" + processExpr(s.slice(i + 1, cl)) + ")";
         i = cl + 1; continue;
       }
@@ -2484,16 +2490,32 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
       // olinadi, "+" belgisi esa formulada joyida (alohida matn sifatida) qoladi —
       // aks holda "+" yo'qolib, ikkita had bir-biriga ko'paytirilgandek hisoblanib
       // qolardi (masalan √(3²+4²) noto'g'ri √(3²·4²) bo'lib qolishi mumkin edi).
+      // YANA MUHIM: agar matn "13π" kabi RAQAM+O'ZGARUVCHI/KONSTANTA ketma-ketligi
+      // bo'lsa, daraja FAQAT oxirgi bitta belgiga (π) tegishli bo'lishi kerak — "13"
+      // koeffitsiyent bo'lib qolaveradi (standart matematik qoida: 13π² = 13·π²,
+      // (13π)² emas). Shuning uchun: agar matn RAQAM bilan tugasa — butun sonni
+      // (masalan "12.5") bazaga olamiz; aks holda (harf/π/e bilan tugasa) — faqat
+      // O'SHA BITTA oxirgi belgini bazaga olamiz, oldingi son/harflar prefiks bo'lib qoladi.
       const curNode = collectTextNodes(nodes).find(n => n.id === cursor);
       const fullVal = curNode ? curNode.value : "";
-      const m = fullVal.match(/^(.*?)([0-9a-zA-Z.\u03c0]*)$/);
-      const prefix = m ? m[1] : "";
-      const baseVal = m ? m[2] : fullVal;
+      let prefix = "", baseVal = "";
+      if (fullVal) {
+        const numMatch = fullVal.match(/[0-9]*\.?[0-9]+$/);
+        if (numMatch && /[0-9]$/.test(fullVal)) {
+          baseVal = numMatch[0];
+          prefix = fullVal.slice(0, fullVal.length - baseVal.length);
+        } else if (/[a-zA-Z\u03c0]$/.test(fullVal)) {
+          baseVal = fullVal.slice(-1);
+          prefix = fullVal.slice(0, -1);
+        } else {
+          prefix = fullVal;
+        }
+      }
       const baseSlot = slotNode(baseVal ? [textNode(baseVal)] : []);
       const expSlot = slotNode();
       struct = createNode("sup", "", [baseSlot, expSlot]);
       setNodes(prev => {
-        // Operator (prefix) qismi joriy tugunda qoladi, faqat baza qismi olib tashlanadi
+        // Operator/koeffitsiyent (prefix) qismi joriy tugunda qoladi, faqat baza qismi olib tashlanadi
         const cleared = fullVal ? updateTextNode(prev, cursor, () => prefix) : prev;
         return insertStructureInto(cleared, cursor, struct, after);
       });
