@@ -4921,6 +4921,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
   const [tab,setTab]=useState("tests");
   const [tests,setTests]=useState([]); const [users,setUsers]=useState([]); const [results,setResults]=useState([]);
   const [creating,setCreating]=useState(false); const [editing,setEditing]=useState(null);
+  const [openResultTest,setOpenResultTest]=useState(null); // "Natijalar" bo'limida ochilgan test
   const [adminDocPreview,setAdminDocPreview]=useState(null); // {type:"pdf"|"latex", url?, source?, name}
   const [confirmModal,setConfirmModal]=useState(null);
   const [exportModal,setExportModal]=useState(null); // {dataUrl, filename, tsv, isBinary}
@@ -5241,7 +5242,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
 
       <div style={{background:C.card,borderBottom:`1px solid ${C.border}`,display:"flex",padding:"0 16px",overflowX:"auto"}}>
         {[["tests","📋 Testlar"],["users","👥 O'quvchilar"],["results","📊 Natijalar"],["combined","🏆 Umumiy natijalar"]].map(([t,l])=>(
-          <button key={t} onClick={()=>{setTab(t);setCreating(false);setEditing(null);}} style={{padding:"14px 18px",background:"none",border:"none",cursor:"pointer",color:tab===t?C.primary:C.textMid,fontWeight:tab===t?800:500,borderBottom:tab===t?`3px solid ${C.primary}`:"3px solid transparent",fontSize:14,whiteSpace:"nowrap",flexShrink:0}}>{l}</button>
+          <button key={t} onClick={()=>{setTab(t);setCreating(false);setEditing(null);setOpenResultTest(null);}} style={{padding:"14px 18px",background:"none",border:"none",cursor:"pointer",color:tab===t?C.primary:C.textMid,fontWeight:tab===t?800:500,borderBottom:tab===t?`3px solid ${C.primary}`:"3px solid transparent",fontSize:14,whiteSpace:"nowrap",flexShrink:0}}>{l}</button>
         ))}
       </div>
       <div style={{padding:20,maxWidth:960,margin:"0 auto"}}>
@@ -5356,14 +5357,38 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                 </div>
               );
             })()}
-            {tests.map(test=>{
+            {openResultTest===null && results.length>0 && <p style={{margin:"0 0 12px",fontSize:13,color:C.textMid}}>Natijalarni ko'rish uchun testni tanlang.</p>}
+            {openResultTest===null && <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:12}}>
+              {tests.map(test=>{
+                const tr=results.filter(r=>r.testId===test.id);
+                if(!tr.length) return null;
+                const total=testTotalItems(test)||1;
+                const avg=Math.round(tr.reduce((a,r)=>a+(r.totalScore||0),0)/tr.length/total*100);
+                const last=Math.max(...tr.map(r=>r.id));
+                return (
+                  <button key={test.id} onClick={()=>setOpenResultTest(test.id)} style={{...S.card,padding:16,textAlign:"left",cursor:"pointer",display:"flex",flexDirection:"column",gap:8,font:"inherit",color:C.text}}>
+                    <span style={{fontWeight:800,fontSize:15,color:C.primary}}>{test.name}</span>
+                    <span style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                      <span style={{...S.badge,background:C.primaryLight,color:C.primary}}>👥 {tr.length} ta topshirdi</span>
+                      <span style={{...S.badge,background:avg>=70?C.successLight:avg>=50?C.warningLight:C.dangerLight,color:avg>=70?C.successDark:avg>=50?C.warning:C.danger}}>o'rtacha {avg}%</span>
+                    </span>
+                    <span style={{fontSize:12,color:C.textLight}}>{testTotalItems(test)} savol • oxirgi: {new Date(last).toLocaleDateString("uz-UZ")}</span>
+                    <span style={{fontSize:12.5,color:C.primary,fontWeight:700}}>Ko'rish →</span>
+                  </button>
+                );
+              })}
+            </div>}
+            {openResultTest!==null && tests.map(test=>{
+              if(test.id!==openResultTest) return null;
               const tr=results.filter(r=>r.testId===test.id);
-              if(!tr.length) return null;
               return (
                 <div key={test.id} style={{marginBottom:24}}>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
-                    <h4 style={{margin:0,color:C.primary}}>{test.name}</h4>
+                  <div style={{display:"flex",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:10}}>
+                    <button onClick={()=>setOpenResultTest(null)} style={{...S.btnGhost,padding:"7px 12px"}}>← Barcha testlar</button>
+                    <h4 style={{margin:0,color:C.primary,fontSize:16}}>{test.name}</h4>
+                    <span style={{...S.badge,background:C.primaryLight,color:C.primary}}>{tr.length} ta topshirdi</span>
                   </div>
+                  {tr.length===0&&<div style={S.empty}>Bu testni hali hech kim topshirmagan</div>}
                   <div style={{overflowX:"auto"}}>
                     <table style={S.table}>
                       <thead><tr>{["#","F.I.O","Guruh","Ball","Foiz",...(testEligibleForRasch(test)?["Rash ball","Daraja"]:[]),"Vaqt","Sana"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
