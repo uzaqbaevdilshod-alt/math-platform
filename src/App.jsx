@@ -779,7 +779,7 @@ const FIREBASE_CONFIG = {
   messagingSenderId: "109909968975",
   appId: "1:109909968975:web:7b5c4ba4a80a54085ac23a",
 };
-const FIREBASE_SYNC_COLLECTIONS = ["users", "tests", "results", "teachers", "partners", "partnerUploads", "raschResults", "appSettings", "groups"];
+const FIREBASE_SYNC_COLLECTIONS = ["users", "tests", "results", "teachers", "partners", "partnerUploads", "raschResults", "appSettings", "groups", "centerGroups"];
 
 let fbApp = null, fbFirestore = null, fbSdkLoading = false, fbListenersReady = false;
 function isFirebaseConfigured() { return !!(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.projectId); }
@@ -1922,7 +1922,8 @@ function importRaschFromRows(test, rows, settings = DEFAULT_RASCH_SETTINGS) {
   all.forEach((r, idx) => {
     if (r.testId !== test.id || siteIdxUsed.has(idx)) return;
     const u = users.find(x => x.phone === r.userPhone);
-    combined.push({ name: null, siteName: u ? `${u.firstName} ${u.lastName}` : r.userPhone, group: u?.group || "", source: "Sayt", vector: resultItemVector(test, r), siteIdx: idx });
+    const cg = u?.centerGroupId ? centerGroupInfo(u.centerGroupId) : null; // markaz guruhidagi o'quvchi
+    combined.push({ name: null, siteName: u ? `${u.firstName} ${u.lastName}` : r.userPhone, group: cg ? cg.centerName : (u?.group || ""), source: cg ? `Sayt · ${cg.centerName}` : "Sayt", vector: resultItemVector(test, r), siteIdx: idx });
   });
 
   // 3) Javob qatori bor hammasi BITTA populyatsiya sifatida hisoblanadi
@@ -1942,7 +1943,7 @@ function importRaschFromRows(test, rows, settings = DEFAULT_RASCH_SETTINGS) {
       matched++;
       updated[e.siteIdx] = { ...updated[e.siteIdx], rasch: { ...c, calculatedAt, settings, source: e.name ? "site+upload" : "site" } };
     }
-    allRows.push(slimRaschRow({ name: e.name || e.siteName, group: e.group, source: e.name ? (e.siteIdx >= 0 ? e.source + " (saytda ham bor)" : e.source) : "Sayt", ...c }));
+    allRows.push(slimRaschRow({ name: e.name || e.siteName, group: e.group, source: e.name ? (e.siteIdx >= 0 ? e.source + " (saytda ham bor)" : e.source) : (e.source || "Sayt"), ...c }));
     if (e.name) {
       const row = slimRaschRow({ name: e.name, group: e.group, ...c, matchedSite: e.siteIdx >= 0, batchId: e.batchId ?? null });
       fileRows.push(row);
@@ -1994,7 +1995,10 @@ function saveRaschUpload(batch) {
 function calculateRaschCombined(test, settings = DEFAULT_RASCH_SETTINGS) {
   const allUploads = db.get("partnerUploads") || [];
   const partners = db.get("partners") || [];
-  const batches = allUploads.filter(u => u.testId === test.id);
+  // Natijalar e'lon qilingandan KEYIN o'quv markazi yuklagan fayllar hisobga olinmaydi
+  const publishedAt = (db.get("tests") || []).find(t => t.id === test.id)?.raschPublishedAt || null;
+  const lateUpload = (u) => u.partnerId !== "admin" && publishedAt && u.uploadedAt > publishedAt;
+  const batches = allUploads.filter(u => u.testId === test.id && !lateUpload(u));
   const taggedRows = [];
   batches.forEach(b => {
     const src = b.partnerId === "admin" ? `Admin: ${b.fileName || "fayl"}` : (partners.find(p => p.id === b.partnerId)?.name || b.partnerName || "Hamkor markaz");
@@ -2012,7 +2016,7 @@ function calculateRaschCombined(test, settings = DEFAULT_RASCH_SETTINGS) {
   }
   const summary = {
     id: test.id, testId: test.id, testName: test.name, calculatedAt: r.calculatedAt,
-    count: r.allRows.length, siteCount: r.allRows.filter(x => x.source === "Sayt").length,
+    count: r.allRows.length, siteCount: r.allRows.filter(x => /^Sayt/.test(x.source || "")).length,
     files: batches.map(b => ({ id: b.id, partnerId: b.partnerId, source: b.partnerId === "admin" ? `Admin: ${b.fileName || "fayl"}` : (partners.find(p => p.id === b.partnerId)?.name || "Hamkor markaz"), rows: (b.rawRows || []).length, uploadedAt: b.uploadedAt })),
     rows: r.allRows,
     itemShare: r.overallShare, itemN: r.vecCount,
@@ -2440,11 +2444,12 @@ function loadJsZip() {
 }
 // Har bir markaz uchun alohida PDF + umumiy natijalar PDF'i bitta ZIP papkaga joylanadi.
 // onProgress(tayyor, jami) — jarayonni ko'rsatish uchun.
-async function buildAllCentersZip({ summary, uploads, onProgress }) {
+async function buildAllCentersZip({ summary, test, onProgress }) {
   const JSZip = await loadJsZip();
   const partners = db.get("partners") || [];
-  const files = uploads.filter(u => String(u.testId) === String(summary.id) && u.partnerId !== "admin" && (u.rows || []).length);
-  const total = files.length + 1;
+  // Hisobotga kiradigan markazlar: Excel fayl yuklaganlar VA guruhidagi o'quvchilar saytda topshirganlar
+  const centers = partners.map(p => ({ p, d: centerReportData(p.id, test, "current") })).filter(x => x.d.rows.length);
+  const total = centers.length + 1;
   const zip = new JSZip();
   const folderName = pdfSafeName(`${summary.testName}_markazlar_natijalari`);
   const folder = zip.folder(folderName);
@@ -2456,9 +2461,8 @@ async function buildAllCentersZip({ summary, uploads, onProgress }) {
   folder.file(uniq(`00_Umumiy_natijalar_${pdfSafeName(summary.testName)}.pdf`), await overall.blob.arrayBuffer());
   URL.revokeObjectURL(overall.url);
   onProgress && onProgress(++done, total);
-  for (const u of files) {
-    const centerName = partners.find(p => p.id === u.partnerId)?.name || u.partnerName || "O'quv markazi";
-    const pdf = await buildCenterReportPdf({ centerName, testName: summary.testName, rows: u.rows || [], stats: u.stats });
+  for (const { p, d } of centers) {
+    const pdf = await buildCenterReportPdf({ centerName: p.name || "O'quv markazi", testName: summary.testName, rows: d.rows, stats: d.stats });
     folder.file(uniq(pdf.filename), await pdf.blob.arrayBuffer());
     URL.revokeObjectURL(pdf.url);
     onProgress && onProgress(++done, total);
@@ -2466,7 +2470,7 @@ async function buildAllCentersZip({ summary, uploads, onProgress }) {
   }
   const bytes = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE", compressionOptions: { level: 6 } });
   const blob = new Blob([bytes], { type: "application/zip" });
-  return { url: URL.createObjectURL(blob), filename: `${folderName}.zip`, blob, count: files.length };
+  return { url: URL.createObjectURL(blob), filename: `${folderName}.zip`, blob, count: centers.length };
 }
 
 // PDF tayyor bo'lgach ko'rsatiladigan oyna — yuklab olish havolasi foydalanuvchining o'zi
@@ -3654,6 +3658,68 @@ function partnerNameTaken(name, exceptId) {
   if ((db.get("teachers") || []).some(t => normPersonName(t.login) === n)) return true;
   return (db.get("partners") || []).some(p => p.id !== exceptId && (normPersonName(p.name) === n || normPersonName(p.login) === n));
 }
+// ===== O'QUV MARKAZI GURUHLARI =====
+// Admin/o'qituvchi ochgan guruhlardan ("groups", user.group) BUTUNLAY ALOHIDA. O'quv markazi o'z
+// guruhini ochadi va unga parol qo'yadi ("centerGroups"). O'quvchi guruh nomi + parol bilan
+// qo'shiladi va user.centerGroupId maydoniga yoziladi — user.group (oddiy guruh) o'zgarmaydi.
+// Shu guruh a'zolarining saytdagi test natijalari o'sha markaz paneliga chiqadi.
+function centerGroupsOf(partnerId) { return (db.get("centerGroups") || []).filter(g => g.partnerId === partnerId); }
+function centerGroupInfo(groupId) {
+  if (!groupId) return null;
+  const g = (db.get("centerGroups") || []).find(x => x.id === groupId);
+  if (!g) return null;
+  const p = (db.get("partners") || []).find(x => x.id === g.partnerId);
+  return { group: g, partner: p || null, centerName: p?.name || "O'quv markazi" };
+}
+function centerMembers(partnerId) {
+  const ids = new Set(centerGroupsOf(partnerId).map(g => g.id));
+  return (db.get("users") || []).filter(u => u.centerGroupId && ids.has(u.centerGroupId));
+}
+// Markazning saytdagi o'quvchilari bo'yicha bitta test natijalari.
+// mode: "published" — faqat e'lon qilingan Rash (markaz uchun), "current" — joriy hisob (admin uchun)
+function centerSiteRows(partnerId, test, mode) {
+  const gname = Object.fromEntries(centerGroupsOf(partnerId).map(g => [g.id, g.name]));
+  const byPhone = new Map(centerMembers(partnerId).map(u => [u.phone, u]));
+  const eligible = testEligibleForRasch(test);
+  return (db.get("results") || []).filter(r => r.testId === test.id && byPhone.has(r.userPhone)).map(r => {
+    const u = byPhone.get(r.userPhone);
+    const rs = mode === "published" ? r.raschPublished : r.rasch;
+    const ok = eligible && rs && rs.ball != null;
+    return {
+      name: `${u.firstName} ${u.lastName}`, group: gname[u.centerGroupId] || "", correct: r.totalScore ?? null, total: testTotalItems(test),
+      ...(ok ? { alg: rs.alg, geo: rs.geo, ball: rs.ball, foiz: rs.foiz, bmba: rs.bmba, daraja: rs.daraja, rank: rs.rank } : {}),
+      vector: eligible ? resultItemVector(test, r) : null, fromSite: true, resultId: r.id, timeTaken: r.timeTaken, date: r.id,
+    };
+  });
+}
+// Markaz hisoboti (PDF) uchun ma'lumot: markaz yuklagan Excel qatorlari + markaz guruhidagi saytda
+// topshirganlar (Rash bali bor bo'lganlari). Savollar statistikasi ikkalasidan birga hisoblanadi.
+function centerReportData(partnerId, test, mode) {
+  const b = (db.get("partnerUploads") || []).find(u => u.testId === test.id && u.partnerId === partnerId);
+  const fileRows = mode === "published" ? (b?.publishedRows || []) : (b?.rows || []);
+  const bStats = mode === "published" ? b?.publishedStats : b?.stats;
+  const fileNames = new Set(fileRows.map(r => normPersonName(r.name)));
+  const site = centerSiteRows(partnerId, test, mode).filter(r => r.ball != null && !fileNames.has(normPersonName(r.name)));
+  const nb = (b?.rawRows || []).filter(x => x.itemsStr || x.items).length;
+  let itemShare = bStats?.itemShare || null;
+  const sv = site.map(r => r.vector).filter(v => v && v.length === RASCH_REQUIRED_ITEMS);
+  if (sv.length) {
+    const S = new Array(RASCH_REQUIRED_ITEMS).fill(0);
+    sv.forEach(v => v.forEach((x, i) => { S[i] += x ? 1 : 0; }));
+    itemShare = S.map((x, i) => ((itemShare ? itemShare[i] * nb : 0) + x) / ((itemShare ? nb : 0) + sv.length));
+  }
+  const sum = (db.get("raschResults") || []).find(x => x.id === test.id);
+  const sumBalls = (sum?.rows || []).map(r => r.ball).filter(v => typeof v === "number" && isFinite(v));
+  const stats = {
+    itemShare,
+    overallShare: bStats?.overallShare || sum?.itemShare || null,
+    overallMean: bStats?.overallMean ?? (sumBalls.length ? sumBalls.reduce((a, c) => a + c, 0) / sumBalls.length : null),
+    overallCount: bStats?.overallCount || (sum?.rows || []).length || null,
+  };
+  const rows = [...fileRows, ...site.map(({ vector, fromSite, resultId, timeTaken, date, ...r }) => r)];
+  return { rows, stats, fileCount: fileRows.length, siteCount: site.length };
+}
+
 // ===== GURUHLAR =====
 // Guruhni admin/o'qituvchi ochadi ("groups" to'plami) yoki testni biror guruhga mo'ljallaganda
 // o'sha guruh ham ochilgan hisoblanadi. O'quvchi guruhlar ro'yxatini ko'rmaydi — nomini o'zi
@@ -4683,7 +4749,7 @@ function RaschCombinedView({ tests, onExport, onRecalc, busyId, version }) {
     if (!summary || zipProgress) return;
     setZipProgress({ done: 0, total: 1 });
     try {
-      const z = await buildAllCentersZip({ summary, uploads: db.get("partnerUploads") || [], onProgress: (done, total) => setZipProgress({ done, total }) });
+      const z = await buildAllCentersZip({ summary, test, onProgress: (done, total) => setZipProgress({ done, total }) });
       setPdfReady({ ...z, title: `🗂 ZIP tayyor: ${z.count} ta markaz + umumiy hisobot` });
     } catch (e) { setFlash("❌ " + (e.message || "ZIP yaratilmadi")); setTimeout(() => setFlash(null), 5000); }
     setZipProgress(null);
@@ -4718,11 +4784,12 @@ function RaschCombinedView({ tests, onExport, onRecalc, busyId, version }) {
     setFlash("✅ PDF hisobot sozlamalari saqlandi."); setTimeout(() => setFlash(null), 3000);
   };
   const adminCenterPdf = async (f) => {
-    const u = uploads.find(x => x.id === f.id);
-    if (!u) return;
+    if (!test) return;
     setPdfBusy(f.id);
     try {
-      const pdf = await buildCenterReportPdf({ centerName: f.source, testName: summary?.testName || test?.name || "", rows: u.rows || [], stats: u.stats });
+      // Markaz fayli + markaz guruhidagi saytda topshirganlar (joriy hisob bo'yicha)
+      const d = centerReportData(f.partnerId, test, "current");
+      const pdf = await buildCenterReportPdf({ centerName: f.source, testName: summary?.testName || test?.name || "", rows: d.rows, stats: d.stats });
       setPdfReady(pdf);
     } catch (e) { setFlash("❌ " + (e.message || "PDF yaratilmadi")); setTimeout(() => setFlash(null), 5000); }
     setPdfBusy(null);
@@ -4738,7 +4805,9 @@ function RaschCombinedView({ tests, onExport, onRecalc, busyId, version }) {
   const test = tests.find(t => String(t.id) === String(testId));
   const summary = store.find(x => String(x.id) === String(testId));
   const testUploads = uploads.filter(u => String(u.testId) === String(testId));
-  const newFiles = summary ? testUploads.filter(u => u.uploadedAt > summary.calculatedAt).length : testUploads.length;
+  const pubAtNow = (db.get("tests") || []).find(t => String(t.id) === String(testId))?.raschPublishedAt || null;
+  const notLate = (u) => !(u.partnerId !== "admin" && pubAtNow && u.uploadedAt > pubAtNow); // e'londan keyingi markaz fayllari hisobga olinmaydi
+  const newFiles = summary ? testUploads.filter(u => notLate(u) && u.uploadedAt > summary.calculatedAt).length : testUploads.filter(notLate).length;
   const rows = useMemo(() => summary ? [...summary.rows].sort((a, b) => (b.ball ?? -999) - (a.ball ?? -999)).map((r, i) => ({ ...r, _pos: i + 1 })) : [], [summary]);
   const sources = useMemo(() => [...new Set(rows.map(r => r.source || ""))].filter(Boolean).sort(), [rows]);
   const q = query.trim().toLowerCase();
@@ -4797,7 +4866,7 @@ function RaschCombinedView({ tests, onExport, onRecalc, busyId, version }) {
           {eligible.map(t => <option key={t.id} value={t.id}>{t.name}{store.some(x => x.id === t.id) ? "" : " (hali hisoblanmagan)"}</option>)}
         </select>
         {test && <button onClick={() => onRecalc(test)} disabled={busyId === test.id} style={{ ...S.btnSmall, background: "#6D28D9", padding: "10px 16px", opacity: busyId === test.id ? 0.6 : 1 }}>{busyId === test.id ? "⏳ Hisoblanmoqda..." : "🔄 Qayta hisoblash"}</button>}
-        {summary && partnerFiles.some(u => (u.rows || []).length) && <button onClick={allCentersZip} disabled={!!zipProgress} style={{ ...S.btnSmall, background: "#0E7490", padding: "10px 16px", opacity: zipProgress ? 0.7 : 1 }}>{zipProgress ? `⏳ ${zipProgress.done}/${zipProgress.total} PDF tayyorlanmoqda...` : "🗂 Barcha markazlar (ZIP)"}</button>}
+        {summary && test && (db.get("partners") || []).some(p => centerReportData(p.id, test, "current").rows.length) && <button onClick={allCentersZip} disabled={!!zipProgress} style={{ ...S.btnSmall, background: "#0E7490", padding: "10px 16px", opacity: zipProgress ? 0.7 : 1 }}>{zipProgress ? `⏳ ${zipProgress.done}/${zipProgress.total} PDF tayyorlanmoqda...` : "🗂 Barcha markazlar (ZIP)"}</button>}
         {summary && rows.length > 0 && <button onClick={overallPdf} disabled={overallPdfBusy} style={{ ...S.btnSmall, background: "#0891B2", padding: "10px 16px", opacity: overallPdfBusy ? 0.6 : 1 }}>{overallPdfBusy ? "⏳ PDF tayyorlanmoqda..." : "📄 PDF (umumiy)"}</button>}
         {summary && rows.length > 0 && <button onClick={() => { const ex = buildRaschCalcExport(filtered); if (ex) onExport({ ...ex, filename: `${summary.testName}_umumiy_natijalar.xlsx` }); }} style={{ ...S.btnSmall, background: C.successDark, padding: "10px 16px" }}>📥 Excel</button>}
       </div>
@@ -4820,7 +4889,7 @@ function RaschCombinedView({ tests, onExport, onRecalc, busyId, version }) {
         <>
           {newFiles > 0 && <div style={{ ...S.card, padding: "10px 14px", marginBottom: 12, background: "#FFFBEB", border: "1.5px solid #FDE68A", color: "#92400E", fontSize: 13, fontWeight: 600 }}>⏳ Oxirgi hisobdan keyin {newFiles} ta yangi fayl kelgan — "🔄 Qayta hisoblash"ni bosing.</div>}
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(130px,1fr))", gap: 10, marginBottom: 12 }}>
-            {[["O'quvchilar", withBall.length], ["Saytdan", filtered.filter(r => r.source === "Sayt").length], ["Fayllardan", filtered.filter(r => r.source !== "Sayt").length], ["O'rtacha ball", avg != null ? avg.toFixed(1) : "—"]].map(([l, v]) => (
+            {[["O'quvchilar", withBall.length], ["Saytdan", filtered.filter(r => /^Sayt/.test(r.source || "")).length], ["Fayllardan", filtered.filter(r => !/^Sayt/.test(r.source || "")).length], ["O'rtacha ball", avg != null ? avg.toFixed(1) : "—"]].map(([l, v]) => (
               <div key={l} style={{ ...S.card, padding: "12px 14px" }}>
                 <div style={{ fontSize: 22, fontWeight: 900, color: "#6D28D9", fontVariantNumeric: "tabular-nums" }}>{v}</div>
                 <div style={{ fontSize: 12, color: C.textMid }}>{l}</div>
@@ -5117,7 +5186,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
         const site=rs.filter(r=>r.testId===t.id);
         const sum=sums.find(x=>x.id===t.id);
         if(!sum) return site.length>0;
-        const siteInSum=(sum.rows||[]).filter(r=>r.source==="Sayt"||/saytda ham bor/.test(r.source||"")).length;
+        const siteInSum=(sum.rows||[]).filter(r=>/^Sayt/.test(r.source||"")||/saytda ham bor/.test(r.source||"")).length;
         return siteInSum!==site.length || site.some(r=>r.id>sum.calculatedAt);
       });
       if(!stale.length) return;
@@ -5259,7 +5328,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
               const tr=results.filter(r=>r.testId===test.id);
               const testFiles=(db.get("partnerUploads")||[]).filter(u=>u.testId===test.id);
               const pendingPartners=testFiles.length;
-              const unpublishedPartners=testFiles.filter(u=>u.partnerId!=="admin"&&!u.publishedRows).length;
+              const unpublishedPartners=testFiles.filter(u=>u.partnerId!=="admin"&&!u.publishedRows&&!(test.raschPublishedAt&&u.uploadedAt>test.raschPublishedAt)).length;
               const endAt=test.startedAt?new Date(test.startedAt+test.duration*60000).toLocaleTimeString("uz-UZ",{hour:"2-digit",minute:"2-digit"}):null;
               return (
                 <div key={test.id} style={{...S.card,padding:18,marginBottom:12}}>
@@ -5515,6 +5584,123 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
 }
 
 // ===== STUDENT DASHBOARD =====
+// ===== O'QUV MARKAZI: GURUHLARIM =====
+function CenterGroupsTab({ partnerInfo }) {
+  const pid = partnerInfo?.id;
+  const [tick, setTick] = useState(0);
+  const refresh = () => setTick(t => t + 1);
+  useEffect(() => { window.addEventListener("firestore-sync", refresh); return () => window.removeEventListener("firestore-sync", refresh); }, []);
+  const groups = centerGroupsOf(pid).sort((a, b) => a.name.localeCompare(b.name));
+  const users = db.get("users") || [];
+  const [form, setForm] = useState({ name: "", pw: "" });
+  const [err, setErr] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [openId, setOpenId] = useState(null);
+  const [pwEdit, setPwEdit] = useState({}); // {groupId: "yangi parol"}
+  const [confirm, setConfirm] = useState(null);
+  const create = async () => {
+    setErr(""); setMsg("");
+    const name = form.name.trim().replace(/\s+/g, " ");
+    if (!name || !form.pw) { setErr("Guruh nomi va parolni kiriting!"); return; }
+    if (form.pw.length < 4) { setErr("Parol kamida 4 ta belgidan iborat bo'lsin!"); return; }
+    if (groups.some(g => normGroupName(g.name) === normGroupName(name))) { setErr("Sizda bu nomli guruh allaqachon bor!"); return; }
+    setBusy(true);
+    try {
+      // Boshqa markazda ham shu nom va shu parol bilan guruh bo'lsa — o'quvchi adashmasligi uchun boshqa parol so'raladi
+      for (const g of (db.get("centerGroups") || []).filter(g => normGroupName(g.name) === normGroupName(name))) {
+        if (await verifyPassword(g.password, form.pw)) { setErr("Bu nom va parol band. Boshqa parol tanlang."); setBusy(false); return; }
+      }
+      const g = { id: `cg${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, partnerId: pid, name, password: await hashPassword(form.pw), createdAt: Date.now() };
+      db.set("centerGroups", [...(db.get("centerGroups") || []), g]);
+      setForm({ name: "", pw: "" }); setMsg(`✅ "${name}" guruhi ochildi. O'quvchilarga guruh nomi va parolini ayting.`); refresh();
+    } catch (e) { setErr(e.message || "Xatolik yuz berdi."); }
+    setBusy(false);
+  };
+  const changePw = async (g) => {
+    const np = (pwEdit[g.id] || "").trim();
+    if (np.length < 4) { setErr("Yangi parol kamida 4 ta belgi bo'lsin!"); return; }
+    try {
+      const h = await hashPassword(np);
+      db.set("centerGroups", (db.get("centerGroups") || []).map(x => x.id === g.id ? { ...x, password: h } : x));
+      setPwEdit(p => ({ ...p, [g.id]: "" })); setMsg(`🔑 "${g.name}" guruhi paroli almashtirildi. Guruhdagi o'quvchilar guruhda qoladi.`); refresh();
+    } catch (e) { setErr(e.message); }
+  };
+  const del = (g) => setConfirm({
+    message: `"${g.name}" guruhi o'chirilsinmi? Undagi o'quvchilar guruhdan chiqariladi va ularning natijalari sizga ko'rinmay qoladi.`,
+    onConfirm: () => {
+      db.set("centerGroups", (db.get("centerGroups") || []).filter(x => x.id !== g.id));
+      db.set("users", (db.get("users") || []).map(u => u.centerGroupId === g.id ? { ...u, centerGroupId: null } : u));
+      setConfirm(null); refresh();
+    },
+  });
+  const removeMember = (u) => {
+    db.set("users", (db.get("users") || []).map(x => x.phone === u.phone ? { ...x, centerGroupId: null } : x));
+    refresh();
+  };
+  return (
+    <div>
+      {confirm && <ConfirmModal message={confirm.message} onConfirm={confirm.onConfirm} onCancel={() => setConfirm(null)} />}
+      <div style={{ ...S.card, padding: 18, marginBottom: 16 }}>
+        <p style={{ margin: "0 0 4px", fontWeight: 800, fontSize: 15 }}>➕ Yangi guruh ochish</p>
+        <p style={{ margin: "0 0 12px", fontSize: 12.5, color: C.textMid, lineHeight: 1.5 }}>O'quvchilaringiz saytda ro'yxatdan o'tib, guruh nomi va parolini yozib qo'shiladi. Shu guruhdagi o'quvchilarning saytdagi test natijalari "📊 Natijalarim" bo'limida ko'rinadi.</p>
+        {err && <div style={S.err}>{err}</div>}
+        {msg && <div style={{ background: C.successLight, color: C.successDark, borderRadius: 10, padding: "10px 14px", fontSize: 13, marginBottom: 12, fontWeight: 600 }}>{msg}</div>}
+        <label style={S.label} htmlFor="cg_name">Guruh nomi</label>
+        <input id="cg_name" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="Masalan: Matematika-1" style={S.input} />
+        <label style={S.label} htmlFor="cg_pw">Guruhga kirish paroli</label>
+        <input id="cg_pw" value={form.pw} onChange={e => setForm(f => ({ ...f, pw: e.target.value }))} onKeyDown={e => e.key === "Enter" && create()} placeholder="Kamida 4 ta belgi" style={S.input} />
+        <button onClick={create} disabled={busy} style={{ ...S.btnPrimary, background: "#0891B2", opacity: busy ? 0.6 : 1 }}>{busy ? "⏳ Saqlanmoqda..." : "Guruh ochish"}</button>
+      </div>
+      {groups.length === 0 && <div style={{ ...S.card, padding: 24, textAlign: "center", color: C.textLight, fontSize: 13 }}>Hali guruh ochilmagan</div>}
+      {groups.map(g => {
+        const members = users.filter(u => u.centerGroupId === g.id);
+        const open = openId === g.id;
+        return (
+          <div key={g.id} style={{ ...S.card, padding: 16, marginBottom: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+              <button onClick={() => setOpenId(open ? null : g.id)} style={{ background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left", display: "flex", alignItems: "center", gap: 8 }}>
+                <b style={{ fontSize: 15, color: "#0891B2" }}>👥 {g.name}</b>
+                <span style={{ ...S.badge, background: "#CFFAFE", color: "#0891B2" }}>{members.length} o'quvchi</span>
+                <span style={{ fontSize: 12, color: C.textMid, transform: open ? "rotate(180deg)" : "none", transition: "transform 0.2s" }}>▼</span>
+              </button>
+              <button onClick={() => del(g)} style={{ ...S.btnSmall, background: C.danger, padding: "6px 10px", fontSize: 12 }}>🗑 O'chirish</button>
+            </div>
+            {open && (
+              <div style={{ marginTop: 12 }}>
+                <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+                  <input value={pwEdit[g.id] || ""} onChange={e => setPwEdit(p => ({ ...p, [g.id]: e.target.value }))} placeholder="Yangi parol" style={{ ...S.input, margin: 0, flex: "1 1 180px", fontSize: 13 }} />
+                  <button onClick={() => changePw(g)} style={{ ...S.btnSmall, background: C.primary, whiteSpace: "nowrap" }}>🔑 Parolni almashtirish</button>
+                </div>
+                {members.length === 0
+                  ? <p style={{ margin: 0, fontSize: 13, color: C.textLight }}>Guruhga hali hech kim qo'shilmagan.</p>
+                  : <div style={{ overflowX: "auto" }}><table style={{ ...S.table, fontSize: 13 }}>
+                      <thead><tr>{["#", "F.I.O", "Topshirgan testlar", ""].map(h => <th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                      <tbody>{members.map((u, i) => (
+                        <tr key={u.phone}>
+                          <td style={S.td}>{i + 1}</td>
+                          <td style={S.td}>{u.firstName} {u.lastName}</td>
+                          <td style={S.td}>{(db.get("results") || []).filter(r => r.userPhone === u.phone).length}</td>
+                          <td style={S.td}><button onClick={() => removeMember(u)} style={{ ...S.btnSmall, background: C.dangerLight, color: C.danger, padding: "4px 10px", fontSize: 12 }}>Guruhdan chiqarish</button></td>
+                        </tr>
+                      ))}</tbody>
+                    </table></div>}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Markaz paneli jadvallari uchun ixcham uslub — barcha ustunlar telefonda ham gorizontal
+// aylantirmasdan to'liq ko'rinsin (ism kerak bo'lsa ikki qatorga o'tadi).
+const PT = {
+  table: { width: "100%", borderCollapse: "collapse", fontSize: 12.5, tableLayout: "auto" },
+  th: { padding: "8px 5px", background: C.primaryLight, color: C.primary, textAlign: "left", fontWeight: 700, borderBottom: `2px solid ${C.border}`, fontSize: 11.5, whiteSpace: "normal", lineHeight: 1.2 },
+  td: { padding: "8px 5px", borderBottom: `1px solid ${C.border}`, color: C.text, fontSize: 12.5, fontVariantNumeric: "tabular-nums", wordBreak: "break-word" },
+};
 // ===== HAMKOR MARKAZ PANELI =====
 // Juda cheklangan: faqat testlar nomini ko'radi (tanlash uchun), Excel faylini
 // yuklaydi, va shu bitta amal — saytdagi natijalar bilan birgalikda Rash modeliga
@@ -5537,6 +5723,13 @@ function PartnerPanel({ partnerInfo, onLogout }) {
   const [answersModal, setAnswersModal] = useState(null); // {test}
 
   const reloadUploads = () => setUploads((db.get("partnerUploads")||[]).filter(u=>u.partnerId===partnerInfo?.id));
+  // Boshqa qurilmalardan (o'quvchilar test topshirsa, admin e'lon qilsa) kelgan o'zgarishlarda yangilanadi
+  const [, setSyncTick] = useState(0);
+  useEffect(() => {
+    const h = () => { reloadUploads(); setTests(db.get("tests") || []); setSyncTick(t => t + 1); };
+    window.addEventListener("firestore-sync", h);
+    return () => window.removeEventListener("firestore-sync", h);
+  }, []);
 
   const handleLogoFile = (e) => {
     const file = e.target.files[0];
@@ -5566,6 +5759,8 @@ function PartnerPanel({ partnerInfo, onLogout }) {
     const test = tests.find(t => t.id === Number(selectedTestId) || t.id === selectedTestId);
     if (!test) return;
     if (!(test.active || test.everActivated)) { setErr("Bu test hali faollashtirilmagan — natija yuklab bo'lmaydi."); return; }
+    const fresh = (db.get("tests")||[]).find(t => t.id === test.id) || test;
+    if (fresh.raschPublishedAt) { setErr(`"${test.name}" bo'yicha natijalar allaqachon e'lon qilingan. Endi fayl qabul qilinmaydi va hisobga olinmaydi.`); return; }
     if (!testEligibleForRasch(test)) { setErr(`Rash modeli faqat aynan ${RASCH_REQUIRED_ITEMS} ta savol/banddan iborat testlar uchun ishlaydi. Bu testda ${testTotalItems(test)} ta bor, shuning uchun fayl yuklab bo'lmaydi.`); return; }
     setBusy(true); setMsg(null); setErr(null);
     const reader = new FileReader();
@@ -5601,18 +5796,27 @@ function PartnerPanel({ partnerInfo, onLogout }) {
 
   const [pdfReady, setPdfReady] = useState(null);
   const [pdfBusyId, setPdfBusyId] = useState(null);
-  const printPDF = async (batch) => {
-    setPdfBusyId(batch.id); setErr(null);
+  const [openRes, setOpenRes] = useState({}); // "📊 Natijalarim"da ochilgan test kartalari
+  const toggleRes = (k) => setOpenRes(p => ({ ...p, [k]: !p[k] }));
+  // Markaz hisoboti: e'lon qilingan Excel natijalari + markaz guruhidagi saytda topshirganlar (e'lon qilingan Rash)
+  const printPDF = async (testId, testName, busyKey) => {
+    setPdfBusyId(busyKey); setErr(null);
     try {
       const centerName = (db.get("partners")||[]).find(p=>p.id===partnerInfo?.id)?.name || partnerInfo?.name || "O'quv markazi";
-      const pdf = await buildCenterReportPdf({ centerName, testName: batch.testName, rows: batch.publishedRows || [], stats: batch.publishedStats });
+      const test = (db.get("tests")||[]).find(t=>t.id===testId) || { id: testId, name: testName, questions: [] };
+      const d = centerReportData(partnerInfo?.id, test, "published");
+      const pdf = await buildCenterReportPdf({ centerName, testName, rows: d.rows, stats: d.stats });
       setPdfReady(pdf);
     } catch (e) { setErr(e.message || "PDF yaratishda xatolik yuz berdi."); setTab("results"); }
     setPdfBusyId(null);
   };
 
   // Statistika: barcha yuklamalar bo'yicha umumlashtirilgan ko'rsatkichlar
-  const allRows = uploads.flatMap(u => (u.publishedRows||[]).map(r => ({ ...r, testName: u.testName })));
+  const allRows = [
+    ...uploads.flatMap(u => (u.publishedRows||[]).map(r => ({ ...r, testName: u.testName }))),
+    // guruhlardagi o'quvchilarning saytdagi (e'lon qilingan) Rash natijalari ham statistikaga kiradi
+    ...(db.get("tests")||[]).flatMap(t => centerSiteRows(partnerInfo?.id, t, "published").filter(r => r.ball != null).map(r => ({ ...r, testName: t.name }))),
+  ];
   const withBall = allRows.filter(r => typeof r.ball === "number");
   const avgBall = withBall.length ? (withBall.reduce((a,b)=>a+b.ball,0)/withBall.length) : null;
   const darajaCounts = {};
@@ -5678,7 +5882,7 @@ function PartnerPanel({ partnerInfo, onLogout }) {
       {logoErr && <div style={{ background:"#FEF2F2", color:"#991B1B", padding:"8px 20px", fontSize:12.5, fontWeight:600 }}>⚠️ {logoErr}</div>}
 
       <div style={{ display: "flex", background: "white", borderBottom: `1.5px solid ${C.border}` }}>
-        {[["upload","📤 Yuklash"],["view","🧾 Testlar"],["results","📊 Natijalarim"],["stats","📈 Statistika"]].map(([t,l])=>(
+        {[["upload","📤 Yuklash"],["groups","👥 Guruhlarim"],["view","🧾 Testlar"],["results","📊 Natijalarim"],["stats","📈 Statistika"]].map(([t,l])=>(
           <button key={t} onClick={()=>{setTab(t); if(t!=="upload") reloadUploads();}} style={{
             flex:1, padding:"13px 4px", background: tab===t?"#ECFEFF":"transparent",
             border:"none", borderBottom: tab===t?"3px solid #0891B2":"3px solid transparent",
@@ -5687,7 +5891,7 @@ function PartnerPanel({ partnerInfo, onLogout }) {
         ))}
       </div>
 
-      <div style={{ padding: 20, maxWidth: 560, margin: "0 auto" }}>
+      <div style={{ padding: "20px 12px", maxWidth: 960, margin: "0 auto", boxSizing: "border-box" }}>
 
         {tab==="upload" && (
           <div style={{ ...S.card, padding: 18 }}>
@@ -5696,7 +5900,7 @@ function PartnerPanel({ partnerInfo, onLogout }) {
             <label style={S.label}>Test tanlang</label>
             <select value={selectedTestId} onChange={e=>setSelectedTestId(e.target.value)} style={S.input}>
               <option value="">— Testni tanlang —</option>
-              {tests.filter(t=>(t.active||t.everActivated)&&testEligibleForRasch(t)).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+              {tests.filter(t=>(t.active||t.everActivated)&&testEligibleForRasch(t)).map(t => <option key={t.id} value={t.id} disabled={!!t.raschPublishedAt}>{t.name}{t.raschPublishedAt?" — natijalar e'lon qilingan":""}</option>)}
             </select>
             <p style={{margin:"-6px 0 12px",fontSize:11,color:C.textLight}}>Faqat kamida bir marta faollashtirilgan VA aynan {RASCH_REQUIRED_ITEMS} ta savol/banddan iborat testlar ro'yxatda ko'rinadi.</p>
 
@@ -5747,11 +5951,68 @@ function PartnerPanel({ partnerInfo, onLogout }) {
           </div>
         )}
 
+        {tab==="groups" && <CenterGroupsTab partnerInfo={partnerInfo}/>}
+
         {tab==="results" && (
           <div>
             <PdfReadyModal pdf={pdfReady} onClose={()=>setPdfReady(null)}/>
             {err && <div style={{ marginBottom: 12, padding: "12px 14px", borderRadius: 10, background: "#FEF2F2", color: "#991B1B", fontSize: 13, fontWeight: 600 }}>⚠️ {err}</div>}
-            {uploads.length===0 && <div style={{...S.card,padding:24,textAlign:"center",color:C.textLight,fontSize:13}}>Hali hech qanday fayl yuklanmagan</div>}
+            {(()=>{
+              // Markaz guruhlaridagi o'quvchilarning saytda topshirgan natijalari (testlar bo'yicha)
+              const pid = partnerInfo?.id;
+              const siteTests = (db.get("tests")||[]).map(t => ({ t, rows: centerSiteRows(pid, t, "published") })).filter(x => x.rows.length);
+              if (!siteTests.length) return centerGroupsOf(pid).length ? null : (
+                <div style={{...S.card,padding:14,marginBottom:14,fontSize:12.5,color:C.textMid,lineHeight:1.5}}>💡 "👥 Guruhlarim" bo'limida guruh ochsangiz, guruhingizdagi o'quvchilarning saytda topshirgan natijalari shu yerda ko'rinadi.</div>
+              );
+              return (
+                <div style={{marginBottom:18}}>
+                  <p style={{margin:"0 0 10px",fontWeight:800,fontSize:14}}>🎓 Guruhlaringizdagi o'quvchilar (saytda topshirgan)</p>
+                  {siteTests.map(({t, rows}) => {
+                    const eligible = testEligibleForRasch(t);
+                    const published = rows.some(r => r.ball != null);
+                    const hasBatch = uploads.some(u => u.testId === t.id);
+                    const sorted = [...rows].sort((a,b) => (b.ball ?? -999) - (a.ball ?? -999) || (b.correct||0) - (a.correct||0));
+                    return (
+                      <div key={t.id} style={{...S.card,padding:16,marginBottom:12}}>
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:openRes["site_"+t.id]?10:0,flexWrap:"wrap",gap:8}}>
+                          <div onClick={()=>toggleRes("site_"+t.id)} role="button" aria-expanded={!!openRes["site_"+t.id]} style={{cursor:"pointer",flex:"1 1 200px"}}>
+                            <h4 style={{margin:"0 0 2px",fontSize:14,color:"#0891B2"}}>{t.name} <span style={{fontSize:11,color:C.textMid,display:"inline-block",transform:openRes["site_"+t.id]?"rotate(180deg)":"none",transition:"transform 0.2s"}}>▼</span></h4>
+                            <p style={{margin:0,fontSize:11,color:C.textLight}}>{rows.length} o'quvchi • {testTotalItems(t)} savol</p>
+                          </div>
+                          {eligible && published && !hasBatch && <button onClick={()=>printPDF(t.id, t.name, "site_"+t.id)} disabled={pdfBusyId==="site_"+t.id} style={{...S.btnSmall,background:"#0891B2",padding:"7px 12px",fontSize:12,opacity:pdfBusyId==="site_"+t.id?0.6:1}}>{pdfBusyId==="site_"+t.id?"⏳ Tayyorlanmoqda...":"📄 PDF qilib yuklab olish"}</button>}
+                        </div>
+                        {eligible && !published && <p style={{margin:"0 0 10px",fontSize:12,color:"#065F46",background:"#ECFDF5",padding:"8px 10px",borderRadius:8}}>✅ Natijalar qabul qilindi. Rash bo'yicha ball tez orada e'lon qilinadi.</p>}
+                        {openRes["site_"+t.id]&&(
+                        <div style={{overflowX:"auto"}}>
+                          <table style={PT.table}>
+                            <thead><tr>{["#","F.I.O","Guruh","To'g'ri","Foiz",...(eligible&&published?["Rash ball","Daraja"]:[]),"Sana"].map(h=><th key={h} style={PT.th}>{h}</th>)}</tr></thead>
+                            <tbody>{sorted.map((r,i)=>{
+                              const pct = r.total ? Math.round((r.correct||0)/r.total*100) : 0;
+                              const dc = darajaColor(r.daraja);
+                              return (
+                                <tr key={r.resultId} style={{background:i%2===0?C.card:"#FAFBFF"}}>
+                                  <td style={PT.td}>{i+1}</td>
+                                  <td style={PT.td}>{r.name}</td>
+                                  <td style={PT.td}>{r.group}</td>
+                                  <td style={PT.td}>{r.correct ?? "-"}/{r.total}</td>
+                                  <td style={PT.td}><b style={{color:pct>=70?C.successDark:pct>=50?C.warning:C.danger}}>{pct}%</b></td>
+                                  {eligible&&published&&<td style={PT.td}><b style={{color:"#0891B2"}}>{r.ball!=null?r.ball.toFixed(1):"-"}</b></td>}
+                                  {eligible&&published&&<td style={PT.td}>{r.daraja?<span style={{...S.badge,background:dc+"22",color:dc,fontWeight:800}}>{r.daraja}</span>:"-"}</td>}
+                                  <td style={PT.td}>{new Date(r.date).toLocaleDateString("uz-UZ")}</td>
+                                </tr>
+                              );
+                            })}</tbody>
+                          </table>
+                        </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
+            {uploads.length>0 && <p style={{margin:"0 0 10px",fontWeight:800,fontSize:14}}>📤 Yuklangan Excel fayllar</p>}
+            {uploads.length===0 && centerGroupsOf(partnerInfo?.id).length===0 && <div style={{...S.card,padding:24,textAlign:"center",color:C.textLight,fontSize:13}}>Hali hech qanday fayl yuklanmagan</div>}
             {uploads.slice().sort((a,b)=>b.uploadedAt-a.uploadedAt).map(batch=>{
               // Admin e'lon qilmaguncha markaz hech qanday ball ko'rmaydi — faqat "qabul qilindi" yozuvi
               const isPending = !batch.publishedRows;
@@ -5759,12 +6020,12 @@ function PartnerPanel({ partnerInfo, onLogout }) {
               const nUploaded = (batch.rawRows || []).length;
               return (
                 <div key={batch.id} style={{...S.card,padding:16,marginBottom:14}}>
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
-                    <div>
-                      <h4 style={{margin:"0 0 2px",fontSize:14,color:"#0891B2"}}>{batch.testName}</h4>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:(isPending||openRes[batch.id])?10:0,flexWrap:"wrap",gap:8}}>
+                    <div onClick={()=>!isPending&&toggleRes(batch.id)} role={isPending?undefined:"button"} aria-expanded={isPending?undefined:!!openRes[batch.id]} style={{cursor:isPending?"default":"pointer",flex:"1 1 200px"}}>
+                      <h4 style={{margin:"0 0 2px",fontSize:14,color:"#0891B2"}}>{batch.testName}{!isPending&&<> <span style={{fontSize:11,color:C.textMid,display:"inline-block",transform:openRes[batch.id]?"rotate(180deg)":"none",transition:"transform 0.2s"}}>▼</span></>}</h4>
                       <p style={{margin:0,fontSize:11,color:C.textLight}}>Yuklangan: {new Date(batch.uploadedAt).toLocaleString("uz-UZ")} • {nUploaded} o'quvchi{batch.publishedAt?` • E'lon qilingan: ${new Date(batch.publishedAt).toLocaleString("uz-UZ")}`:""}</p>
                     </div>
-                    {!isPending && <button onClick={()=>printPDF(batch)} disabled={pdfBusyId===batch.id} style={{...S.btnSmall,background:"#0891B2",padding:"7px 12px",fontSize:12,opacity:pdfBusyId===batch.id?0.6:1}}>{pdfBusyId===batch.id?"⏳ Tayyorlanmoqda...":"📄 PDF qilib yuklab olish"}</button>}
+                    {!isPending && <button onClick={()=>printPDF(batch.testId, batch.testName, batch.id)} disabled={pdfBusyId===batch.id} style={{...S.btnSmall,background:"#0891B2",padding:"7px 12px",fontSize:12,opacity:pdfBusyId===batch.id?0.6:1}}>{pdfBusyId===batch.id?"⏳ Tayyorlanmoqda...":"📄 PDF qilib yuklab olish"}</button>}
                   </div>
                   {isPending ? (
                     <div style={{padding:"18px 14px",borderRadius:10,background:"#ECFDF5",border:"1.5px solid #A7F3D0",textAlign:"center"}}>
@@ -5772,21 +6033,21 @@ function PartnerPanel({ partnerInfo, onLogout }) {
                       <p style={{margin:0,fontSize:14,fontWeight:800,color:"#065F46"}}>Natijangiz qabul qilindi</p>
                       <p style={{margin:"4px 0 0",fontSize:13,color:"#047857"}}>Tez orada Rash modelida hisoblanadi.</p>
                     </div>
-                  ) : (
+                  ) : openRes[batch.id] && (
                   <div style={{overflowX:"auto"}}>
-                    <table style={S.table}>
-                      <thead><tr>{["O'rin","F.I.O","To'g'ri","Algebra","Geometriya","BALL","Daraja"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                    <table style={PT.table}>
+                      <thead><tr>{["#","F.I.O","To'g'ri","Algebra","Geometriya","BALL","Daraja"].map(h=><th key={h} style={PT.th}>{h}</th>)}</tr></thead>
                       <tbody>{[...rows].sort((a,b)=>(b.ball??-999)-(a.ball??-999)).map((r,i)=>{
                         const dc = darajaColor(r.daraja);
                         return (
                           <tr key={i} style={{background:i%2===0?C.card:"#FAFBFF"}}>
-                            <td style={S.td}>{r.rank ?? i+1}</td>
-                            <td style={S.td}>{r.name}</td>
-                            <td style={S.td}>{r.correct??"-"}/{r.total??"-"}</td>
-                            <td style={S.td}>{r.alg!=null?r.alg.toFixed(1):"-"}</td>
-                            <td style={S.td}>{r.geo!=null?r.geo.toFixed(1):"-"}</td>
-                            <td style={S.td}><b style={{color:"#0891B2"}}>{r.ball!=null?r.ball.toFixed(1):"-"}</b></td>
-                            <td style={S.td}>{r.daraja?<span style={{...S.badge,background:dc+"22",color:dc,fontWeight:800}}>{r.daraja}</span>:"-"}</td>
+                            <td style={PT.td}>{i+1}</td>
+                            <td style={PT.td}>{r.name}</td>
+                            <td style={PT.td}>{r.correct??"-"}/{r.total??"-"}</td>
+                            <td style={PT.td}>{r.alg!=null?r.alg.toFixed(1):"-"}</td>
+                            <td style={PT.td}>{r.geo!=null?r.geo.toFixed(1):"-"}</td>
+                            <td style={PT.td}><b style={{color:"#0891B2"}}>{r.ball!=null?r.ball.toFixed(1):"-"}</b></td>
+                            <td style={PT.td}>{r.daraja?<span style={{...S.badge,background:dc+"22",color:dc,fontWeight:800}}>{r.daraja}</span>:"-"}</td>
                           </tr>
                         );
                       })}</tbody>
@@ -5882,12 +6143,12 @@ function PartnerPanel({ partnerInfo, onLogout }) {
                 <div style={{...S.card,padding:16,marginBottom:14}}>
                   <h4 style={{margin:"0 0 10px",color:C.primary,fontSize:14}}>Yopiq savollar</h4>
                   <div style={{overflowX:"auto"}}>
-                    <table style={S.table}>
-                      <thead><tr>{["#","To'g'ri javob"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                    <table style={PT.table}>
+                      <thead><tr>{["#","To'g'ri javob"].map(h=><th key={h} style={PT.th}>{h}</th>)}</tr></thead>
                       <tbody>{closedQs.map((q,i)=>(
                         <tr key={i} style={{background:i%2===0?C.card:"#FAFBFF"}}>
-                          <td style={S.td}>{i+1}</td>
-                          <td style={{...S.td,fontWeight:700,color:C.successDark}}>{q.correctAnswer||"—"}</td>
+                          <td style={PT.td}>{i+1}</td>
+                          <td style={{...PT.td,fontWeight:700,color:C.successDark}}>{q.correctAnswer||"—"}</td>
                         </tr>
                       ))}</tbody>
                     </table>
@@ -6061,8 +6322,55 @@ function GroupManager() {
   );
 }
 
+// O'quvchi o'quv markazi guruhiga qo'shiladigan oyna: guruh nomi + guruh paroli.
+// Bu admin guruhidan (user.group) alohida — u o'zgarmaydi.
+function CenterGroupJoin({ user, onSave, onLeave, onClose }) {
+  const cur = centerGroupInfo(user.centerGroupId);
+  const [name, setName] = useState("");
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const join = async () => {
+    if (!name.trim() || !pw) { setErr("Guruh nomi va parolni yozing."); return; }
+    setBusy(true); setErr("");
+    try {
+      const cands = (db.get("centerGroups") || []).filter(g => normGroupName(g.name) === normGroupName(name));
+      for (const g of cands) {
+        if (await verifyPassword(g.password, pw)) { setBusy(false); onSave(g); return; }
+      }
+      setErr("Guruh nomi yoki paroli noto'g'ri. O'quv markazingizdan aniq so'rab, qayta yozing.");
+    } catch (e) { setErr(e.message || "Xatolik yuz berdi."); }
+    setBusy(false);
+  };
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.5)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={onClose}>
+      <div style={{ ...S.card, padding: 22, maxWidth: 400, width: "100%" }} onClick={e => e.stopPropagation()}>
+        <h3 style={{ margin: "0 0 4px", fontSize: 18 }}>🏫 O'quv markazi guruhi</h3>
+        {cur && <p style={{ margin: "0 0 12px", color: C.textMid, fontSize: 13 }}>Hozir: <b>{cur.centerName} · {cur.group.name}</b></p>}
+        {err && <div style={S.err}>{err}</div>}
+        <label style={S.label} htmlFor="cgj_name">Guruh nomi</label>
+        <input id="cgj_name" value={name} autoFocus onChange={e => { setName(e.target.value); setErr(""); }} placeholder="Masalan: Matematika-1" style={S.input} />
+        <label style={S.label} htmlFor="cgj_pw">Guruh paroli</label>
+        <input id="cgj_pw" type="password" value={pw} onChange={e => { setPw(e.target.value); setErr(""); }} onKeyDown={e => e.key === "Enter" && join()} style={S.input} />
+        <button onClick={join} disabled={busy} style={{ ...S.btnPrimary, background: "#0891B2", opacity: busy ? 0.6 : 1 }}>{busy ? "⏳ Tekshirilmoqda..." : (cur ? "Guruhni almashtirish" : "Qo'shilish")}</button>
+        {cur && <button onClick={onLeave} style={{ ...S.btnGhost, width: "100%", marginTop: 8, color: C.danger }}>Guruhdan chiqish</button>}
+        <button onClick={onClose} style={{ ...S.btnGhost, width: "100%", marginTop: 8 }}>Bekor qilish</button>
+      </div>
+    </div>
+  );
+}
+
 function StudentDashboard({ user, onLogout, onUserUpdate }) {
   const [groupPicker,setGroupPicker]=useState(false);
+  const [centerPicker,setCenterPicker]=useState(false);
+  const saveCenterGroup = (g) => {
+    const next = (db.get("users") || []).map(u => u.phone === user.phone ? { ...u, centerGroupId: g ? g.id : null } : u);
+    db.set("users", next);
+    const me = next.find(u => u.phone === user.phone);
+    if (me && onUserUpdate) onUserUpdate(me);
+    setCenterPicker(false);
+  };
+  const myCenter = centerGroupInfo(user.centerGroupId);
   const saveGroup = (g) => {
     const users = db.get("users") || [];
     const next = users.map(u => u.phone === user.phone ? { ...u, group: g } : u);
@@ -6131,6 +6439,7 @@ function StudentDashboard({ user, onLogout, onUserUpdate }) {
   return (
     <div style={S.page}>
       {groupPicker&&<GroupPicker user={user} onSave={saveGroup} onClose={()=>setGroupPicker(false)}/>}
+      {centerPicker&&<CenterGroupJoin user={user} onSave={saveCenterGroup} onLeave={()=>saveCenterGroup(null)} onClose={()=>setCenterPicker(false)}/>}
       {/* Document Modal — PDF or LaTeX */}
       {docModal&&(
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",flexDirection:"column"}}>
@@ -6171,7 +6480,7 @@ function StudentDashboard({ user, onLogout, onUserUpdate }) {
       <div style={{background:C.primary,padding:"14px 20px",display:"flex",justifyContent:"space-between",alignItems:"center",boxShadow:"0 2px 12px rgba(79,110,247,0.3)"}}>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
           <div style={{width:40,height:40,borderRadius:"50%",background:"rgba(255,255,255,0.25)",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:17,color:"white"}}>{user.firstName[0]}</div>
-          <div><p style={{margin:0,color:"white",fontWeight:700}}>{user.firstName} {user.lastName}</p><p onClick={()=>setGroupPicker(true)} style={{margin:0,color:"rgba(255,255,255,0.8)",fontSize:12,cursor:"pointer"}}>{user.group?`👥 ${user.group} ✏️`:"👥 Guruhga qo'shilish"}</p></div>
+          <div><p style={{margin:0,color:"white",fontWeight:700}}>{user.firstName} {user.lastName}</p><p onClick={()=>setGroupPicker(true)} style={{margin:0,color:"rgba(255,255,255,0.8)",fontSize:12,cursor:"pointer"}}>{user.group?`👥 ${user.group} ✏️`:"👥 Guruhga qo'shilish"}</p>{myCenter&&<p onClick={()=>setCenterPicker(true)} style={{margin:0,color:"rgba(255,255,255,0.8)",fontSize:12,cursor:"pointer"}}>🏫 {myCenter.centerName} · {myCenter.group.name} ✏️</p>}</div>
         </div>
         <button onClick={onLogout} style={{...S.btnSmall,background:"rgba(255,255,255,0.2)",color:"white"}}>Chiqish</button>
       </div>
@@ -6183,8 +6492,11 @@ function StudentDashboard({ user, onLogout, onUserUpdate }) {
       <div style={{padding:20,maxWidth:800,margin:"0 auto"}}>
         {tab==="tests"&&(
           <div>
-            {!user.group&&(
-              <button onClick={()=>setGroupPicker(true)} style={{...S.btnSmall,background:C.primary,padding:"10px 18px",marginBottom:18}}>👥 Guruhga qo'shilish</button>
+            {(!user.group||!myCenter)&&(
+              <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:18}}>
+                {!user.group&&<button onClick={()=>setGroupPicker(true)} style={{...S.btnSmall,background:C.primary,padding:"10px 18px"}}>👥 Guruhga qo'shilish</button>}
+                {!myCenter&&<button onClick={()=>setCenterPicker(true)} style={{...S.btnSmall,background:"#0891B2",padding:"10px 18px"}}>🏫 O'quv markazi guruhiga qo'shilish</button>}
+              </div>
             )}
             {tests.filter(t=>!t.active&&t.scheduledAt&&t.scheduledAt>now&&visibleForMe(t)).length>0&&(
               <div style={{marginBottom:24}}>
