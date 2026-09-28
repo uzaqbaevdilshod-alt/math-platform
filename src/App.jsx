@@ -4921,7 +4921,8 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
   const [tab,setTab]=useState("tests");
   const [tests,setTests]=useState([]); const [users,setUsers]=useState([]); const [results,setResults]=useState([]);
   const [creating,setCreating]=useState(false); const [editing,setEditing]=useState(null);
-  const [openResultTest,setOpenResultTest]=useState(null); // "Natijalar" bo'limida ochilgan test
+  const [openResultTest,setOpenResultTest]=useState(null);
+  const [studentsOpen,setStudentsOpen]=useState(false); // "O'quvchilar" ro'yxati — bosganda ochiladi // "Natijalar" bo'limida ochilgan test
   const [adminDocPreview,setAdminDocPreview]=useState(null); // {type:"pdf"|"latex", url?, source?, name}
   const [confirmModal,setConfirmModal]=useState(null);
   const [exportModal,setExportModal]=useState(null); // {dataUrl, filename, tsv, isBinary}
@@ -5307,7 +5308,12 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
             {isFullAdmin && <TeacherManager />}
             {isFullAdmin && <PartnerManager />}
             <GroupManager />
-            <h3 style={{marginBottom:16}}>O'quvchilar ({users.length})</h3>
+            <div style={{...S.card,padding:16,marginBottom:18,border:`2px solid ${C.primary}`}}>
+            <button onClick={()=>setStudentsOpen(o=>!o)} aria-expanded={studentsOpen} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,width:"100%",background:"none",border:"none",padding:0,cursor:"pointer",textAlign:"left",marginBottom:studentsOpen?14:0}}>
+              <span style={{display:"flex",alignItems:"center",gap:8}}><b style={{fontSize:15,color:C.primary}}>🎓 O'quvchilar</b><span style={{...S.badge,background:C.primaryLight,color:C.primary}}>{users.length} ta</span></span>
+              <span style={{fontSize:13,color:C.textMid,fontWeight:700,transform:studentsOpen?"rotate(180deg)":"none",transition:"transform 0.2s"}}>▼</span>
+            </button>
+            {studentsOpen&&(<>
             <div style={{overflowX:"auto"}}>
               <table style={S.table}>
                 <thead><tr>{["#","Ism","Familiya","Guruh","ID / Telefon","Testlar","Amal"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
@@ -5337,6 +5343,8 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
               </table>
             </div>
             {users.length===0&&<div style={S.empty}>O'quvchilar yo'q</div>}
+            </>)}
+            </div>
           </div>
         )}
 
