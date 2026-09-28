@@ -2165,7 +2165,14 @@ function pdfFirstPageHeader(doc, cfg, { title, subtitle, heading, subheading }) 
 }
 function pdfResultsTable(doc, rows, startY) {
   const { BLUE, LINE } = PDF_C, M = PDF_M, CW = PDF_CW;
-  const cols = [{ h: "№", w: 12, a: "center" }, { h: "Ism Familiya", w: 86, a: "left" }, { h: "Algebra", w: 22, a: "center" }, { h: "Geometriya", w: 22, a: "center" }, { h: "Ball", w: 22, a: "center" }, { h: "Baho", w: 18, a: "center" }];
+  // Ustunlar Excel shablonidagi "Hisobot" varag'i tartibida: ... Ball, Baho, Foiz, BMBA
+  const cols = [
+    { k: "n", h: "№", w: 10, a: "center" }, { k: "name", h: "Ism Familiya", w: 64, a: "left" },
+    { k: "alg", h: "Algebra", w: 19, a: "center" }, { k: "geo", h: "Geometriya", w: 21, a: "center" },
+    { k: "ball", h: "Ball", w: 18, a: "center" }, { k: "baho", h: "Baho", w: 14, a: "center" },
+    { k: "foiz", h: "Foiz", w: 18, a: "center" }, { k: "bmba", h: "BMBA", w: 18, a: "center" },
+  ];
+  const pct = (v) => (v === null || v === undefined || !isFinite(v)) ? "-" : `${+v.toFixed(1)}%`;
   const RH = 7.2, HH = 8, BOTTOM = 278;
   const drawHeader = (y) => {
     doc.setFillColor(...BLUE); doc.rect(M, y, CW, HH, "F");
@@ -2180,19 +2187,19 @@ function pdfResultsTable(doc, rows, startY) {
     if (i % 2 === 1) { doc.setFillColor(248, 250, 252); doc.rect(M, y, CW, RH, "F"); }
     doc.setDrawColor(...LINE); doc.setLineWidth(0.2); doc.rect(M, y, CW, RH);
     let x = M;
-    const vals = [String(i + 1), r.name || "", pdfNum(r.alg), pdfNum(r.geo), pdfNum(r.ball), r.daraja || ""];
+    const vals = { n: String(i + 1), name: r.name || "", alg: pdfNum(r.alg), geo: pdfNum(r.geo), ball: pdfNum(r.ball), baho: r.daraja || "", foiz: pct(r.foiz), bmba: r.bmba != null && isFinite(r.bmba) ? String(+r.bmba.toFixed(1)) : "-" };
     cols.forEach((c, ci) => {
       if (ci > 0) doc.line(x, y, x, y + RH);
-      if (ci === 5 && r.daraja && PDF_GRADE_COLORS[r.daraja]) {
+      if (c.k === "baho" && r.daraja && PDF_GRADE_COLORS[r.daraja]) {
         doc.setFillColor(...PDF_GRADE_COLORS[r.daraja]); doc.rect(x + 0.2, y + 0.2, c.w - 0.4, RH - 0.4, "F");
         doc.setTextColor(255, 255, 255); doc.setFont(PDF_FONT, "bold");
       } else {
-        if (ci === 0) doc.setTextColor(100, 116, 139); else doc.setTextColor(...PDF_C.TEXT);
-        doc.setFont(PDF_FONT, ci === 4 ? "bold" : "normal");
+        if (c.k === "n") doc.setTextColor(100, 116, 139); else doc.setTextColor(...PDF_C.TEXT);
+        doc.setFont(PDF_FONT, c.k === "ball" ? "bold" : "normal");
       }
       doc.setFontSize(8.5);
-      let t = vals[ci];
-      if (ci === 1) t = doc.splitTextToSize(t, c.w - 4)[0] || "";
+      let t = vals[c.k];
+      if (c.k === "name") t = doc.splitTextToSize(t, c.w - 4)[0] || "";
       if (c.a === "left") doc.text(t, x + 2.5, y + 4.8);
       else doc.text(t, x + c.w / 2, y + 4.8, { align: "center" });
       x += c.w;
@@ -2417,14 +2424,59 @@ async function buildOverallReportPdf({ testName, rows, itemShare, itemN }) {
   return pdfFinish(doc, `${pdfSafeName(testName)}_${pdfSafeName(cfg.orgName)}.pdf`);
 }
 
+// ===== BARCHA MARKAZLAR HISOBOTLARI — BITTA ZIP =====
+let jsZipLoading = null;
+function loadJsZip() {
+  if (window.JSZip) return Promise.resolve(window.JSZip);
+  if (jsZipLoading) return jsZipLoading;
+  jsZipLoading = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+    s.onload = () => resolve(window.JSZip);
+    s.onerror = () => { jsZipLoading = null; reject(new Error("ZIP kutubxonasi yuklanmadi. Internet aloqasini tekshiring.")); };
+    document.head.appendChild(s);
+  });
+  return jsZipLoading;
+}
+// Har bir markaz uchun alohida PDF + umumiy natijalar PDF'i bitta ZIP papkaga joylanadi.
+// onProgress(tayyor, jami) — jarayonni ko'rsatish uchun.
+async function buildAllCentersZip({ summary, uploads, onProgress }) {
+  const JSZip = await loadJsZip();
+  const partners = db.get("partners") || [];
+  const files = uploads.filter(u => String(u.testId) === String(summary.id) && u.partnerId !== "admin" && (u.rows || []).length);
+  const total = files.length + 1;
+  const zip = new JSZip();
+  const folderName = pdfSafeName(`${summary.testName}_markazlar_natijalari`);
+  const folder = zip.folder(folderName);
+  const used = new Set();
+  const uniq = (name) => { let n = name, k = 2; while (used.has(n.toLowerCase())) n = name.replace(/\.pdf$/i, `_${k++}.pdf`); used.add(n.toLowerCase()); return n; };
+  let done = 0;
+  onProgress && onProgress(done, total);
+  const overall = await buildOverallReportPdf({ testName: summary.testName, rows: summary.rows || [], itemShare: summary.itemShare, itemN: summary.itemN });
+  folder.file(uniq(`00_Umumiy_natijalar_${pdfSafeName(summary.testName)}.pdf`), await overall.blob.arrayBuffer());
+  URL.revokeObjectURL(overall.url);
+  onProgress && onProgress(++done, total);
+  for (const u of files) {
+    const centerName = partners.find(p => p.id === u.partnerId)?.name || u.partnerName || "O'quv markazi";
+    const pdf = await buildCenterReportPdf({ centerName, testName: summary.testName, rows: u.rows || [], stats: u.stats });
+    folder.file(uniq(pdf.filename), await pdf.blob.arrayBuffer());
+    URL.revokeObjectURL(pdf.url);
+    onProgress && onProgress(++done, total);
+    await new Promise(r => setTimeout(r, 0)); // sahifa qotib qolmasligi uchun
+  }
+  const bytes = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE", compressionOptions: { level: 6 } });
+  const blob = new Blob([bytes], { type: "application/zip" });
+  return { url: URL.createObjectURL(blob), filename: `${folderName}.zip`, blob, count: files.length };
+}
+
 // PDF tayyor bo'lgach ko'rsatiladigan oyna — yuklab olish havolasi foydalanuvchining o'zi
 // bosadigan tugma (ba'zi ilovalar, masalan Telegram, avtomatik yuklab olishni bloklaydi).
-function PdfReadyModal({ pdf, onClose }) {
+function PdfReadyModal({ pdf, onClose, title }) {
   if (!pdf) return null;
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.5)", zIndex: 99999, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={onClose}>
       <div style={{ background: "white", borderRadius: 16, padding: 22, maxWidth: 360, width: "100%", boxShadow: "0 10px 40px rgba(0,0,0,0.25)" }} onClick={e => e.stopPropagation()}>
-        <p style={{ margin: "0 0 4px", fontSize: 16, fontWeight: 800, color: C.text }}>📄 PDF hisobot tayyor</p>
+        <p style={{ margin: "0 0 4px", fontSize: 16, fontWeight: 800, color: C.text }}>{pdf.title || title || "📄 PDF hisobot tayyor"}</p>
         <p style={{ margin: "0 0 16px", fontSize: 12.5, color: C.textMid, lineHeight: 1.5 }}>Yuklab olish uchun tugmani bosing. Ishlamasa, "Yangi oynada ochish" orqali oching va u yerdan saqlang.</p>
         <a href={pdf.url} download={pdf.filename} style={{ display: "block", textAlign: "center", padding: "12px", borderRadius: 10, background: "#0891B2", color: "white", fontWeight: 800, fontSize: 14, textDecoration: "none", marginBottom: 10, wordBreak: "break-all" }}>⬇️ {pdf.filename}</a>
         <a href={pdf.url} target="_blank" rel="noopener noreferrer" style={{ display: "block", textAlign: "center", padding: "11px", borderRadius: 10, border: `1.5px solid ${C.border}`, color: C.textMid, fontWeight: 700, fontSize: 13, textDecoration: "none", marginBottom: 10 }}>↗ Yangi oynada ochish</a>
@@ -4626,6 +4678,16 @@ function RaschCombinedView({ tests, onExport, onRecalc, busyId, version }) {
   const [pdfBusy, setPdfBusy] = useState(null);
   const [pdfCfg, setPdfCfg] = useState(() => { const { logoSrc, adSrc, ...rest } = getPdfSettings(); return rest; });
   const [overallPdfBusy, setOverallPdfBusy] = useState(false);
+  const [zipProgress, setZipProgress] = useState(null); // {done,total}
+  const allCentersZip = async () => {
+    if (!summary || zipProgress) return;
+    setZipProgress({ done: 0, total: 1 });
+    try {
+      const z = await buildAllCentersZip({ summary, uploads: db.get("partnerUploads") || [], onProgress: (done, total) => setZipProgress({ done, total }) });
+      setPdfReady({ ...z, title: `🗂 ZIP tayyor: ${z.count} ta markaz + umumiy hisobot` });
+    } catch (e) { setFlash("❌ " + (e.message || "ZIP yaratilmadi")); setTimeout(() => setFlash(null), 5000); }
+    setZipProgress(null);
+  };
   const overallPdf = async () => {
     if (!summary) return;
     setOverallPdfBusy(true);
@@ -4735,6 +4797,7 @@ function RaschCombinedView({ tests, onExport, onRecalc, busyId, version }) {
           {eligible.map(t => <option key={t.id} value={t.id}>{t.name}{store.some(x => x.id === t.id) ? "" : " (hali hisoblanmagan)"}</option>)}
         </select>
         {test && <button onClick={() => onRecalc(test)} disabled={busyId === test.id} style={{ ...S.btnSmall, background: "#6D28D9", padding: "10px 16px", opacity: busyId === test.id ? 0.6 : 1 }}>{busyId === test.id ? "⏳ Hisoblanmoqda..." : "🔄 Qayta hisoblash"}</button>}
+        {summary && partnerFiles.some(u => (u.rows || []).length) && <button onClick={allCentersZip} disabled={!!zipProgress} style={{ ...S.btnSmall, background: "#0E7490", padding: "10px 16px", opacity: zipProgress ? 0.7 : 1 }}>{zipProgress ? `⏳ ${zipProgress.done}/${zipProgress.total} PDF tayyorlanmoqda...` : "🗂 Barcha markazlar (ZIP)"}</button>}
         {summary && rows.length > 0 && <button onClick={overallPdf} disabled={overallPdfBusy} style={{ ...S.btnSmall, background: "#0891B2", padding: "10px 16px", opacity: overallPdfBusy ? 0.6 : 1 }}>{overallPdfBusy ? "⏳ PDF tayyorlanmoqda..." : "📄 PDF (umumiy)"}</button>}
         {summary && rows.length > 0 && <button onClick={() => { const ex = buildRaschCalcExport(filtered); if (ex) onExport({ ...ex, filename: `${summary.testName}_umumiy_natijalar.xlsx` }); }} style={{ ...S.btnSmall, background: C.successDark, padding: "10px 16px" }}>📥 Excel</button>}
       </div>
@@ -5300,7 +5363,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                   </div>
                   <div style={{overflowX:"auto"}}>
                     <table style={S.table}>
-                      <thead><tr>{["#","F.I.O","Guruh","Ball","Foiz","Rash ball","Daraja","Vaqt","Sana"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                      <thead><tr>{["#","F.I.O","Guruh","Ball","Foiz",...(testEligibleForRasch(test)?["Rash ball","Daraja"]:[]),"Vaqt","Sana"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
                       <tbody>{tr.sort((a,b)=>b.totalScore-a.totalScore).map((r,i)=>{
                         const u=users.find(u=>u.phone===r.userPhone);
                         const pct=Math.round((r.totalScore/testTotalItems(test))*100);
@@ -5313,8 +5376,8 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                             <td style={S.td}>{u?.group||"-"}</td>
                             <td style={S.td}><b style={{color:pct>=70?C.successDark:pct>=50?C.warning:C.danger}}>{r.totalScore}</b>/{testTotalItems(test)}</td>
                             <td style={S.td}><span style={{color:pct>=70?C.successDark:pct>=50?C.warning:C.danger,fontWeight:700}}>{pct}%</span></td>
-                            <td style={S.td}>{r.rasch?<b style={{color:"#6D28D9"}}>{r.rasch.ball!=null?r.rasch.ball.toFixed(1):"—"}</b>:<span style={{color:C.textLight}}>—</span>}</td>
-                            <td style={S.td}>{dGrade?<span style={{...S.badge,background:dColor+"22",color:dColor,fontWeight:800}}>{dGrade}</span>:<span style={{color:C.textLight}}>—</span>}</td>
+                            {testEligibleForRasch(test)&&<td style={S.td}>{r.rasch?<b style={{color:"#6D28D9"}}>{r.rasch.ball!=null?r.rasch.ball.toFixed(1):"—"}</b>:<span style={{color:C.textLight}}>—</span>}</td>}
+                            {testEligibleForRasch(test)&&<td style={S.td}>{dGrade?<span style={{...S.badge,background:dColor+"22",color:dColor,fontWeight:800}}>{dGrade}</span>:<span style={{color:C.textLight}}>—</span>}</td>}
                             <td style={S.td}>{r.timeTaken?`${r.timeTaken} daq`:"-"}</td>
                             <td style={S.td}>{new Date(r.id).toLocaleDateString("uz-UZ")}</td>
                           </tr>
@@ -6157,7 +6220,7 @@ function StudentDashboard({ user, onLogout, onUserUpdate }) {
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
                     <div><h4 style={{margin:"0 0 4px",fontSize:15}}>{test.name}</h4><p style={{margin:0,color:C.textMid,fontSize:12}}>{new Date(r.id).toLocaleDateString("uz-UZ")}</p>
                       {!r.raschPublished&&testEligibleForRasch(test)&&<p style={{margin:"5px 0 0",fontSize:11,color:C.textLight}}>🎯 Rash natijasi tez orada e'lon qilinadi</p>}
-                      {r.raschPublished&&(()=>{ const dg=r.raschPublished.daraja; const dc=dg==="NC"?C.danger:(dg==="C"||dg==="C+")?C.warning:C.successDark;
+                      {r.raschPublished&&testEligibleForRasch(test)&&(()=>{ const dg=r.raschPublished.daraja; const dc=dg==="NC"?C.danger:(dg==="C"||dg==="C+")?C.warning:C.successDark;
                         return <p style={{margin:"5px 0 0",display:"inline-flex",alignItems:"center",gap:6}}><span style={{fontSize:11,color:C.textMid}}>🎯 Rash:</span><b style={{color:"#6D28D9",fontSize:13}}>{r.raschPublished.ball!=null?r.raschPublished.ball.toFixed(1):"—"}</b><span style={{background:dc+"22",color:dc,padding:"2px 8px",borderRadius:6,fontSize:11,fontWeight:800}}>{dg}</span></p>; })()}
                     </div>
                     <div style={{textAlign:"right"}}>
@@ -6309,7 +6372,7 @@ function StudentDashboard({ user, onLogout, onUserUpdate }) {
                               {missed2 ? "—" : `${score}/${total}`}
                             </td>
                             <td style={{padding:"10px 12px"}}>
-                              {r?.raschPublished
+                              {r?.raschPublished&&testEligibleForRasch(t)
                                 ? (()=>{ const dg=r.raschPublished.daraja; const dc=dg==="NC"?C.danger:(dg==="C"||dg==="C+")?C.warning:C.successDark;
                                   return <span style={{display:"inline-flex",alignItems:"center",gap:5}}><b style={{color:"#6D28D9",fontSize:13}}>{r.raschPublished.ball!=null?r.raschPublished.ball.toFixed(1):"—"}</b><span style={{background:dc+"22",color:dc,padding:"2px 7px",borderRadius:6,fontSize:11,fontWeight:800}}>{dg}</span></span>; })()
                                 : <span style={{color:C.textLight,fontSize:12}}>—</span>
@@ -6703,7 +6766,7 @@ function ResultDetail({ result, test, onBack }) {
             <div style={{width:`${pct}%`,height:"100%",background:pct>=70?C.success:pct>=50?C.warning:C.danger,borderRadius:999,transition:"width 1.5s"}}/>
           </div>
         </div>
-        {result.raschPublished&&(()=>{ const dg=result.raschPublished.daraja; const dc=dg==="NC"?C.danger:(dg==="C"||dg==="C+")?C.warning:C.successDark;
+        {result.raschPublished&&testEligibleForRasch(test)&&(()=>{ const dg=result.raschPublished.daraja; const dc=dg==="NC"?C.danger:(dg==="C"||dg==="C+")?C.warning:C.successDark;
           return (
             <div style={{...S.card,padding:20,textAlign:"center",marginBottom:20,background:"linear-gradient(135deg,#F5F3FF,#FFFFFF)",border:"1.5px solid #DDD6FE"}}>
               <p style={{margin:"0 0 8px",color:"#6D28D9",fontSize:13,fontWeight:800}}>🎯 RASH MODELI BO'YICHA BAHOLASH</p>
