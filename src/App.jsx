@@ -4830,7 +4830,10 @@ function RaschCombinedView({ tests, onExport, onRecalc, busyId, version }) {
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
             {["A+", "A", "B+", "B", "C+", "C", "NC"].map(g => {
               const dc = g === "NC" ? C.danger : (g === "C" || g === "C+") ? C.warning : C.successDark;
-              return <span key={g} style={{ ...S.badge, background: dc + "1A", color: dc }}>{g}: {gradeCounts[g] || 0}</span>;
+              const cnt = gradeCounts[g] || 0;
+              // Foiz — tanlangan (filtrlangan) ishtirokchilar soniga nisbatan
+              const pc = withBall.length ? (cnt / withBall.length * 100) : 0;
+              return <span key={g} style={{ ...S.badge, background: dc + "1A", color: dc, fontVariantNumeric: "tabular-nums" }}>{g}: {cnt} <span style={{ fontWeight: 600, opacity: 0.8 }}>({pc.toFixed(1)}%)</span></span>;
             })}
           </div>
           <details style={{ ...S.card, padding: "10px 14px", marginBottom: 12 }}>
