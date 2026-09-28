@@ -2569,18 +2569,31 @@ function createNode(type, value="", children=[]) {
   return { id: uid(), type, value, children };
 }
 
-function slotVal(slot) {
+function slotValRaw(slot) {
   if (!slot) return "";
   if (slot.nodes) return nodesToString(slot.nodes);
   return slot.value || "";
 }
+function slotVal(slot) { return balanceParens(slotValRaw(slot)); }
 function nodeVal(n) {
   if (!n) return "";
   if (n.type === "text") return n.value || "";
   if (n.type === "slot") return slotVal(n);
   return nodesToString([n]);
 }
+// Kasr/daraja/ildiz kataklari ichidagi qavslarni muvozanatlaydi. Formulalar ichki ko'rinishda
+// FRAC(a,b), SUP(a,b) kabi qavslar bilan saqlanadi — katak ichida yopilmagan "(" yoki ortiqcha ")"
+// qolsa (masalan o'chirish paytida), butun tuzilma buzilib "SUP((x+3,)" kabi xom matn chiqib qolardi.
+function balanceParens(str) {
+  let depth = 0, pre = 0;
+  for (const ch of String(str || "")) {
+    if (ch === "(") depth++;
+    else if (ch === ")") { if (depth === 0) pre++; else depth--; }
+  }
+  return "(".repeat(pre) + (str || "") + ")".repeat(depth);
+}
 function nodesToString(nodes) {
+  const slotVal = (slot) => balanceParens(slotValRaw(slot));
   if (!nodes) return "";
   return nodes.map(n => {
     if (n.type === "text") return n.value || "";
@@ -2987,7 +3000,46 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
   // Joriy joy BO'SH bo'lsa: agar shu tuzilma (masalan kasr)ning barcha qismlari bo'sh
   // bo'lsa — butun tuzilmani olib tashlab, atrofdagi matnni birlashtiradi (Desmos kabi).
   // Aks holda — kursorni oldingi joyga o'tkazadi.
+  // Kursor turgan eng ichki daraja (sup) tuzilmasini topadi
+  const findSupAtCursor = (list) => {
+    for (const n of list) {
+      if (n.children) {
+        for (const sl of n.children) { if (sl?.nodes) { const deeper = findSupAtCursor(sl.nodes); if (deeper) return deeper; } }
+        if (n.type === "sup" && n.children.some(sl => sl?.nodes && collectTextNodes(sl.nodes).some(t => t.id === cursor))) return n;
+      } else if (n.type === "slot" && n.nodes) { const d = findSupAtCursor(n.nodes); if (d) return d; }
+    }
+    return null;
+  };
+  // Daraja tuzilmasini "yechadi": uning o'rniga faqat asosdagi elementlar qoladi
+  const unwrapNode = (list, id, replacement) => {
+    const out = [];
+    for (const n of list) {
+      if (n.id === id) { out.push(...replacement); continue; }
+      if (n.type === "slot" && n.nodes) { out.push({ ...n, nodes: unwrapNode(n.nodes, id, replacement) }); continue; }
+      if (n.children) { out.push({ ...n, children: n.children.map(sl => sl?.nodes ? { ...sl, nodes: unwrapNode(sl.nodes, id, replacement) } : sl) }); continue; }
+      out.push(n);
+    }
+    return out;
+  };
   const deleteChar = () => {
+    // Daraja bo'sh bo'lsa — o'chirish tugmasi daraja belgisini olib tashlaydi (asos oddiy matn bo'lib qoladi).
+    // Kursor asosda bo'lsa, shu bilan birga oxirgi belgi ham o'chiriladi.
+    const sup = findSupAtCursor(nodes);
+    if (sup) {
+      const expNodes = sup.children[1]?.nodes || [];
+      const expEmpty = expNodes.every(n => n.type === "text" && !n.value);
+      if (expEmpty) {
+        const inExp = collectTextNodes(expNodes).some(t => t.id === cursor);
+        const baseNodes = (sup.children[0]?.nodes && sup.children[0].nodes.length) ? sup.children[0].nodes : [textNode("")];
+        const next = unwrapNode(nodes, sup.id, baseNodes);
+        const baseTexts = collectTextNodes(baseNodes);
+        if (inExp) { setNodes(next); setCursor(baseTexts[baseTexts.length - 1].id); return; }
+        const cur = baseTexts.find(t => t.id === cursor);
+        setNodes(cur && cur.value ? updateTextNode(next, cursor, v => v.slice(0, -1)) : next);
+        if (!cur) setCursor(baseTexts[baseTexts.length - 1].id);
+        return;
+      }
+    }
     const curNode = collectTextNodes(nodes).find(t => t.id === cursor);
     if (curNode && curNode.value) {
       setNodes(prev => updateTextNode(prev, cursor, v => v.slice(0, -1)));
@@ -3087,7 +3139,24 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
       let prefix = "", baseVal = "";
       if (fullVal) {
         const numMatch = fullVal.match(/[0-9]*\.?[0-9]+$/);
-        if (numMatch && /[0-9]$/.test(fullVal)) {
+        if (fullVal.endsWith(")")) {
+          // Qavs bilan tugagan bo'lsa — butun qavsli ifoda (masalan "(x+2)") darajaning asosi bo'ladi.
+          // Mos ochiluvchi qavsni orqaga qarab qidiramiz (ichma-ich qavslarni hisobga olib).
+          let depth = 0, open = -1;
+          for (let k = fullVal.length - 1; k >= 0; k--) {
+            if (fullVal[k] === ")") depth++;
+            else if (fullVal[k] === "(") { depth--; if (depth === 0) { open = k; break; } }
+          }
+          if (open >= 0) {
+            // Qavsdan oldin funksiya nomi bo'lsa (sin(x) kabi) — u ham asosga kiradi
+            const fnm = fullVal.slice(0, open).match(/(arcsin|arccos|arctan|sinh|cosh|tanh|sin|cos|tan|cot|ln|lg|log)$/);
+            const start = fnm ? open - fnm[1].length : open;
+            baseVal = fullVal.slice(start);
+            prefix = fullVal.slice(0, start);
+          } else {
+            prefix = fullVal;
+          }
+        } else if (numMatch && /[0-9]$/.test(fullVal)) {
           baseVal = numMatch[0];
           prefix = fullVal.slice(0, fullVal.length - baseVal.length);
         } else if (/[a-zA-Z\u03c0]$/.test(fullVal)) {
@@ -3097,7 +3166,7 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
           prefix = fullVal;
         }
       }
-      const baseSlot = slotNode(baseVal ? [textNode(baseVal)] : []);
+      const baseSlot = slotNode(baseVal ? [textNode(baseVal)] : undefined);
       const expSlot = slotNode();
       struct = createNode("sup", "", [baseSlot, expSlot]);
       setNodes(prev => {
@@ -3105,7 +3174,8 @@ function MathKeyboard({ initValue, onChange, onClose, isAdmin }) {
         const cleared = fullVal ? updateTextNode(prev, cursor, () => prefix) : prev;
         return insertStructureInto(cleared, cursor, struct, after);
       });
-      setCursor((expSlot.nodes && expSlot.nodes[0]?.id) || after.id);
+      // Asos bo'sh qolsa — kursor avval asosga qo'yiladi (bo'sh "□" qolib ketmasligi uchun)
+      setCursor(baseVal ? ((expSlot.nodes && expSlot.nodes[0]?.id) || after.id) : ((baseSlot.nodes && baseSlot.nodes[0]?.id) || after.id));
       return;
     }
     else if (type === "abs") struct = createNode("abs", "", [slotNode()]);
