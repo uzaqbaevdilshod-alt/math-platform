@@ -2565,45 +2565,96 @@ async function buildAllCentersZip({ summary, test, onProgress }) {
 
 // ===== TELEGRAM ICHIDA FAYL YUKLAB OLISH =====
 // Telegram Mini App ichki oynasi sayt yaratgan fayllarni (blob:/data: havolalar) yuklab olishga
-// ruxsat bermaydi. Telegram'ning o'z usuli — WebApp.downloadFile({url, file_name}) (Bot API 8.0+),
-// lekin u faqat haqiqiy https:// manzildan ishlaydi. Shuning uchun Telegram ichida fayl avval
-// Firebase Storage'ga ("exports/" papkasi) yuklanadi va o'sha manzil Telegram'ga beriladi.
-// Oddiy brauzerda esa avvalgidek to'g'ridan-to'g'ri yuklanadi.
-let fbStorageLoading = null;
-function loadFirebaseStorage() {
-  if (fbStorageLoading) return fbStorageLoading;
-  fbStorageLoading = new Promise((resolve, reject) => {
-    const t = setTimeout(() => { fbStorageLoading = null; reject(new Error("Firebase yuklanmadi. Internet aloqasini tekshiring.")); }, 20000);
-    loadFirebaseSdk(() => {
-      const done = () => {
-        clearTimeout(t);
-        try {
-          const app = window.firebase.apps.length ? window.firebase.app() : window.firebase.initializeApp(FIREBASE_CONFIG);
-          resolve(window.firebase.storage(app));
-        } catch (e) { fbStorageLoading = null; reject(e); }
-      };
-      if (window.firebase.storage) { done(); return; }
-      const s = document.createElement("script");
-      s.src = "https://www.gstatic.com/firebasejs/9.23.0/firebase-storage-compat.js";
-      s.onload = done;
-      s.onerror = () => { clearTimeout(t); fbStorageLoading = null; reject(new Error("Firebase Storage kutubxonasi yuklanmadi.")); };
-      document.head.appendChild(s);
-    });
+// ruxsat bermaydi. Shuning uchun Telegram ichida: fayl vaqtincha Firestore'ga ("exportFiles"
+// to'plami, bo'laklarga bo'lib) saqlanadi, so'ng sayt telefon brauzerida "#dl-<id>" havolasi bilan
+// ochiladi — brauzer faylni Firestore'dan olib, oddiy usulda yuklab beradi va vaqtinchalik faylni
+// o'chiradi. Qo'shimcha server, Storage yoki login kerak emas. "exportFiles" sinxronlanadigan
+// to'plamlar ro'yxatida YO'Q — katta fayllar hech kimning qurilmasiga avtomatik yuklanmaydi.
+const EXPORT_COL = "exportFiles";
+const EXPORT_CHUNK = 900000; // Firestore hujjati 1 MB dan oshmasligi uchun
+function withTimeout(p, ms, msg) {
+  return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
+}
+async function getFirestoreDb() {
+  if (fbFirestore) return fbFirestore;
+  await withTimeout(new Promise(res => loadFirebaseSdk(res)), 20000, "Firebase'ga ulanib bo'lmadi. Internet aloqasini tekshiring.");
+  const app = window.firebase.apps.length ? window.firebase.app() : window.firebase.initializeApp(FIREBASE_CONFIG);
+  return window.firebase.firestore(app);
+}
+function blobToBase64(blob) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(",")[1] || "");
+    r.onerror = () => rej(new Error("Faylni o'qib bo'lmadi."));
+    r.readAsDataURL(blob);
   });
-  return fbStorageLoading;
 }
-async function uploadExportFile(blob, filename) {
-  const storage = await loadFirebaseStorage();
-  const safe = String(filename || "fayl").replace(/[^\w.\-]+/g, "_");
-  const ref = storage.ref(`exports/${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}/${safe}`);
-  await ref.put(blob, { contentType: blob.type || "application/octet-stream", contentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(filename)}` });
-  return ref.getDownloadURL();
+async function stashExportFile(blob, filename) {
+  const fdb = await getFirestoreDb();
+  const id = Array.from(crypto.getRandomValues(new Uint8Array(15)), x => x.toString(36).padStart(2, "0")).join("").slice(0, 24);
+  const b64 = await blobToBase64(blob);
+  const n = Math.max(1, Math.ceil(b64.length / EXPORT_CHUNK));
+  const createdAt = Date.now();
+  const writes = [];
+  for (let i = 0; i < n; i++) {
+    writes.push(fdb.collection(EXPORT_COL).doc(`${id}_${i}`).set({ id, i, n, filename, mime: blob.type || "application/octet-stream", createdAt, data: b64.slice(i * EXPORT_CHUNK, (i + 1) * EXPORT_CHUNK) }));
+  }
+  await withTimeout(Promise.all(writes), 90000, "Faylni saqlash juda uzoq davom etdi. Internet aloqasini tekshiring.");
+  return id;
 }
-async function toBlob({ blob, url, dataUrl }) {
-  if (blob) return blob;
-  const r = await fetch(url || dataUrl);
-  return r.blob();
+async function fetchExportFile(id) {
+  const fdb = await getFirestoreDb();
+  const snap = await withTimeout(fdb.collection(EXPORT_COL).where("id", "==", id).get(), 60000, "Faylni olish juda uzoq davom etdi.");
+  const parts = snap.docs.map(d => d.data()).sort((a, b) => a.i - b.i);
+  if (!parts.length || parts.length !== parts[0].n) throw new Error("Fayl topilmadi yoki muddati o'tgan. Saytda qaytadan yuklab olishni bosing.");
+  const bin = atob(parts.map(p => p.data).join(""));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return { blob: new Blob([bytes], { type: parts[0].mime }), filename: parts[0].filename, n: parts[0].n };
 }
+async function deleteExportFile(id, n) {
+  try {
+    const fdb = await getFirestoreDb();
+    await Promise.all(Array.from({ length: n }, (_, i) => fdb.collection(EXPORT_COL).doc(`${id}_${i}`).delete()));
+    // 1 kundan eski, yuklab olinmay qolgan fayllarni ham tozalaymiz
+    const old = await fdb.collection(EXPORT_COL).where("createdAt", "<", Date.now() - 86400000).limit(50).get();
+    await Promise.all(old.docs.map(d => d.ref.delete()));
+  } catch (e) { console.warn("[exportFiles] tozalashda xato", e); }
+}
+function exportLinkId() {
+  const m = String(window.location.hash || "").match(/^#dl-([a-z0-9]{16,40})$/i);
+  return m ? m[1] : null;
+}
+// Brauzerda "#dl-<id>" bilan ochilgan sahifa: faylni olib, yuklab beradi
+function ExportDownloadPage({ id }) {
+  const [st, setSt] = useState({ phase: "loading" });
+  const aRef = useRef(null);
+  useEffect(() => {
+    let url = null;
+    fetchExportFile(id).then(f => {
+      url = URL.createObjectURL(f.blob);
+      setSt({ phase: "ready", url, filename: f.filename, n: f.n });
+      setTimeout(() => { try { aRef.current?.click(); } catch {} }, 300);
+    }).catch(e => setSt({ phase: "error", msg: e.message || "Fayl olinmadi." }));
+    return () => { if (url) URL.revokeObjectURL(url); };
+  }, [id]);
+  const onGot = () => { if (st.n) setTimeout(() => deleteExportFile(id, st.n), 8000); };
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ ...S.card, padding: 26, maxWidth: 380, width: "100%", textAlign: "center" }}>
+        <div style={{ fontSize: 44, marginBottom: 8 }}>{st.phase === "error" ? "⚠️" : st.phase === "ready" ? "📥" : "⏳"}</div>
+        {st.phase === "loading" && <p style={{ margin: 0, fontWeight: 700 }}>Fayl tayyorlanmoqda...</p>}
+        {st.phase === "error" && <p style={{ margin: 0, color: C.danger, fontWeight: 600, lineHeight: 1.5 }}>{st.msg}</p>}
+        {st.phase === "ready" && (<>
+          <p style={{ margin: "0 0 14px", fontWeight: 800, fontSize: 16 }}>Fayl tayyor</p>
+          <a ref={aRef} href={st.url} download={st.filename} onClick={onGot} style={{ display: "block", padding: 13, borderRadius: 10, background: C.successDark, color: "white", fontWeight: 800, textDecoration: "none", wordBreak: "break-all" }}>⬇️ {st.filename}</a>
+          <p style={{ margin: "12px 0 0", fontSize: 12, color: C.textMid, lineHeight: 1.5 }}>Yuklab olish avtomatik boshlanmasa, tugmani bosing. Keyin bu oynani yopib, Telegram'ga qayting.</p>
+        </>)}
+      </div>
+    </div>
+  );
+}
+
 // Telegram ichida yoki tashqarisida — bir xil tugma. file: {blob?, url?, dataUrl?, filename}
 function DownloadButton({ file, style, children, onDone }) {
   const [state, setState] = useState(null); // null | "busy" | "ok" | {err}
@@ -2612,26 +2663,28 @@ function DownloadButton({ file, style, children, onDone }) {
     return <a href={file.url || file.dataUrl} download={file.filename} onClick={() => onDone && setTimeout(onDone, 300)} style={style}>{children}</a>;
   }
   const tg = window.Telegram?.WebApp;
+  // 1-bosish: faylni vaqtincha saqlash; 2-bosish: brauzerda ochish (foydalanuvchi bosishi shart)
   const go = async () => {
+    if (state && state.link) { openLink(state.link); return; }
     setState("busy");
     try {
       const b = await toBlob(file);
-      const link = await uploadExportFile(b, file.filename);
-      if (tg?.downloadFile && (!tg.isVersionAtLeast || tg.isVersionAtLeast("8.0"))) tg.downloadFile({ url: link, file_name: file.filename });
-      else if (tg?.openLink) tg.openLink(link);
-      else window.open(link, "_blank");
-      setState("ok");
+      const id = await stashExportFile(b, file.filename);
+      const link = `${window.location.origin}${window.location.pathname}#dl-${id}`;
+      setState({ link });
     } catch (e) {
       console.error("[Yuklab olish]", e);
-      setState({ err: e?.code === "storage/unauthorized" ? "Firebase Storage'ga yozishga ruxsat yo'q (Storage qoidalarini sozlash kerak)." : (e?.message || "Fayl yuklanmadi.") });
+      setState({ err: e?.code === "permission-denied" ? "Bazaga yozishga ruxsat yo'q (Firestore qoidalarida \"exportFiles\" to'plamiga ruxsat bering)." : (e?.message || "Fayl tayyorlanmadi.") });
     }
   };
-  const openInBrowser = () => { try { tg?.openLink ? tg.openLink(window.location.origin + window.location.pathname) : window.open(window.location.href, "_blank"); } catch {} };
+  const openLink = (link) => { try { tg?.openLink ? tg.openLink(link) : window.open(link, "_blank"); } catch { window.open(link, "_blank"); } };
+  const openInBrowser = () => openLink(window.location.origin + window.location.pathname);
   return (
     <>
       <button onClick={go} disabled={state === "busy"} style={{ ...style, width: "100%", border: "none", cursor: "pointer", opacity: state === "busy" ? 0.7 : 1 }}>
-        {state === "busy" ? "⏳ Tayyorlanmoqda..." : state === "ok" ? "✅ Telegram yuklab olmoqda — yana bosish" : children}
+        {state === "busy" ? "⏳ Tayyorlanmoqda..." : (state && state.link) ? "🌐 Brauzerda yuklab olish" : children}
       </button>
+      {state && state.link && <p style={{ margin: "0 0 10px", fontSize: 12, color: C.textMid, lineHeight: 1.5 }}>✅ Fayl tayyor. Tugmani bosing — sayt telefon brauzerida ochiladi va fayl yuklanadi.</p>}
       {state && state.err && (
         <div style={{ background: C.dangerLight, color: C.danger, borderRadius: 10, padding: "10px 12px", fontSize: 12.5, lineHeight: 1.5, marginBottom: 10 }}>
           ⚠️ {state.err}
@@ -2650,7 +2703,7 @@ function PdfReadyModal({ pdf, onClose, title }) {
     <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.5)", zIndex: 99999, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={onClose}>
       <div style={{ background: "white", borderRadius: 16, padding: 22, maxWidth: 360, width: "100%", boxShadow: "0 10px 40px rgba(0,0,0,0.25)" }} onClick={e => e.stopPropagation()}>
         <p style={{ margin: "0 0 4px", fontSize: 16, fontWeight: 800, color: C.text }}>{pdf.title || title || "📄 PDF hisobot tayyor"}</p>
-        <p style={{ margin: "0 0 16px", fontSize: 12.5, color: C.textMid, lineHeight: 1.5 }}>{isInTelegram() ? "Tugmani bosing — fayl Telegram orqali telefoningizga saqlanadi." : "Yuklab olish uchun tugmani bosing. Ishlamasa, \"Yangi oynada ochish\" orqali oching va u yerdan saqlang."}</p>
+        <p style={{ margin: "0 0 16px", fontSize: 12.5, color: C.textMid, lineHeight: 1.5 }}>{isInTelegram() ? "Tugmani bosing — fayl tayyorlanadi va telefon brauzeri orqali yuklab olinadi." : "Yuklab olish uchun tugmani bosing. Ishlamasa, \"Yangi oynada ochish\" orqali oching va u yerdan saqlang."}</p>
         <DownloadButton file={pdf} style={{ display: "block", textAlign: "center", padding: "12px", borderRadius: 10, background: "#0891B2", color: "white", fontWeight: 800, fontSize: 14, textDecoration: "none", marginBottom: 10, wordBreak: "break-all" }}>⬇️ {pdf.filename}</DownloadButton>
         {!isInTelegram() && <a href={pdf.url} target="_blank" rel="noopener noreferrer" style={{ display: "block", textAlign: "center", padding: "11px", borderRadius: 10, border: `1.5px solid ${C.border}`, color: C.textMid, fontWeight: 700, fontSize: 13, textDecoration: "none", marginBottom: 10 }}>↗ Yangi oynada ochish</a>}
         <button onClick={onClose} style={{ width: "100%", padding: "10px", borderRadius: 10, border: "none", background: "transparent", fontWeight: 600, fontSize: 13, cursor: "pointer", color: C.textLight }}>Yopish</button>
@@ -5452,7 +5505,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
         <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.5)", zIndex: 99999, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={()=>setExportModal(null)}>
           <div style={{ background: "white", borderRadius: 16, padding: 22, maxWidth: 360, width: "100%", boxShadow: "0 10px 40px rgba(0,0,0,0.25)" }} onClick={e=>e.stopPropagation()}>
             <p style={{ margin: "0 0 4px", fontSize: 16, fontWeight: 800, color: C.text }}>📥 Excel fayl tayyor</p>
-            <p style={{ margin: "0 0 16px", fontSize: 12.5, color: C.textMid, lineHeight: 1.5 }}>{isInTelegram() ? "Tugmani bosing — fayl Telegram orqali telefoningizga saqlanadi." : "Yuklab olish uchun quyidagi tugmani bosing. Agar tugma ishlamasa, saytni brauzerda (Chrome/Safari) oching."}</p>
+            <p style={{ margin: "0 0 16px", fontSize: 12.5, color: C.textMid, lineHeight: 1.5 }}>{isInTelegram() ? "Tugmani bosing — fayl tayyorlanadi va telefon brauzeri orqali yuklab olinadi." : "Yuklab olish uchun quyidagi tugmani bosing. Agar tugma ishlamasa, saytni brauzerda (Chrome/Safari) oching."}</p>
             <DownloadButton file={exportModal} onDone={()=>setExportModal(null)} style={{ display:"block", textAlign:"center", padding:"12px", borderRadius:10, background:C.successDark, color:"white", fontWeight:800, fontSize:14, textDecoration:"none", marginBottom:10 }}>⬇️ {exportModal.filename}</DownloadButton>
             {!exportModal.isBinary && (
               <button onClick={()=>{ navigator.clipboard?.writeText(exportModal.tsv).then(()=>alert("Nusxalandi! Excel'ga joylashtirishingiz mumkin.")).catch(()=>{}); }} style={{ width:"100%", padding:"11px", borderRadius:10, border:`1.5px solid ${C.border}`, background:"white", fontWeight:700, fontSize:13, cursor:"pointer", color:C.textMid, marginBottom:10 }}>📋 Jadval sifatida nusxalash</button>
@@ -7509,6 +7562,12 @@ function setupTelegramMiniApp() {
 }
 
 export default function App() {
+  // "#dl-<id>" havolasi — Telegram'dan brauzerga yuborilgan faylni yuklab berish sahifasi
+  const dlId = exportLinkId();
+  if (dlId) return <ExportDownloadPage id={dlId}/>;
+  return <MainApp/>;
+}
+function MainApp() {
   useEffect(() => setupTelegramMiniApp(), []); // Telegram ichida pastga tortganda oyna tushib ketmasin
   // Saqlangan sessiya bo'lsa (avval login qilingan bo'lsa), avtomatik tiklaymiz —
   // login/parol qayta so'ralmaydi. Foydalanuvchi ma'lumoti bazadan yangilanib olinadi
