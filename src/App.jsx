@@ -7266,7 +7266,59 @@ function SplashScreen({ onDone }) {
   );
 }
 
+// ===== TELEGRAM MINI APP =====
+// Sayt Telegram bot ichida ochilganda: sahifa tepasida barmoqni pastga tortish Telegram tomonidan
+// "ilovani yig'ish/yopish" deb qabul qilinadi va butun oyna pastga tushib ketadi. Shuni o'chiramiz:
+//  1) Telegram.WebApp.disableVerticalSwipes() — Bot API 7.7+ (hozirgi barcha Telegram ilovalari);
+//  2) eski versiyalar uchun zaxira: sahifa hech qachon aynan eng tepada (scrollY=0) turmaydi —
+//     1px pastda turadi, shuning uchun pastga tortish Telegram'ga emas, sahifaga tegishli bo'ladi.
+// Oddiy brauzerda (Telegram tashqarisida) hech narsa o'zgarmaydi.
+function isInTelegram() {
+  try {
+    return !!(window.TelegramWebviewProxy || window.Telegram?.WebApp?.initData ||
+      /tgWebAppData|tgWebAppVersion/.test(window.location.hash + window.location.search) ||
+      sessionStorage.getItem("__telegram__initParams"));
+  } catch { return false; }
+}
+function loadTelegramSdk() {
+  if (window.Telegram?.WebApp) return Promise.resolve(window.Telegram.WebApp);
+  return new Promise((resolve) => {
+    const s = document.createElement("script");
+    s.src = "https://telegram.org/js/telegram-web-app.js";
+    s.onload = () => resolve(window.Telegram?.WebApp || null);
+    s.onerror = () => resolve(null);
+    document.head.appendChild(s);
+  });
+}
+function setupTelegramMiniApp() {
+  if (!isInTelegram()) return () => {};
+  // ichki (sahifa ichidagi) "rezina" cho'zilishni ham o'chiramiz
+  const st = document.createElement("style");
+  st.textContent = "html,body{overscroll-behavior-y:none;}";
+  document.head.appendChild(st);
+  let cleanupFallback = () => {};
+  loadTelegramSdk().then((tg) => {
+    if (!tg) return;
+    try { tg.ready(); } catch {}
+    try { tg.expand(); } catch {}
+    const modern = typeof tg.disableVerticalSwipes === "function" && (!tg.isVersionAtLeast || tg.isVersionAtLeast("7.7"));
+    if (modern) { try { tg.disableVerticalSwipes(); } catch {} return; }
+    // Zaxira (eski Telegram): sahifani doim kamida 1px aylantirilgan holda ushlab turamiz
+    const pad = document.createElement("div");
+    pad.style.cssText = "height:1px;pointer-events:none";
+    document.body.appendChild(pad);
+    document.body.style.minHeight = "calc(100vh + 2px)";
+    const keepOff = () => { if (window.scrollY < 1) window.scrollTo(0, 1); };
+    keepOff();
+    window.addEventListener("touchstart", keepOff, { passive: true });
+    window.addEventListener("scroll", keepOff, { passive: true });
+    cleanupFallback = () => { window.removeEventListener("touchstart", keepOff); window.removeEventListener("scroll", keepOff); pad.remove(); };
+  });
+  return () => { cleanupFallback(); st.remove(); };
+}
+
 export default function App() {
+  useEffect(() => setupTelegramMiniApp(), []); // Telegram ichida pastga tortganda oyna tushib ketmasin
   // Saqlangan sessiya bo'lsa (avval login qilingan bo'lsa), avtomatik tiklaymiz —
   // login/parol qayta so'ralmaydi. Foydalanuvchi ma'lumoti bazadan yangilanib olinadi
   // (masalan boshqa qurilmada tahrirlangan bo'lishi mumkin).
