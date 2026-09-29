@@ -2230,7 +2230,8 @@ function pdfStatCards(doc, cards, y) {
   });
 }
 // Savollar bo'yicha to'g'ri javoblar ulushi grafigi; overall berilsa — qora chiziq bilan
-function pdfItemChart(doc, share, overall, yy) {
+function pdfItemChart(doc, share, overall, yy, labels) {
+  const lbOf = (i) => labels ? labels[i] : raschItemLabel(i);
   const { GREY } = PDF_C, M = PDF_M, W = PDF_W;
   pdfSectionTitle(doc, "Savollar bo'yicha to'g'ri javoblar ulushi", yy);
   const cx0 = M + 8, cx1 = W - M, cy0 = yy + 8, cy1 = yy + 54;
@@ -2240,7 +2241,7 @@ function pdfItemChart(doc, share, overall, yy) {
     doc.setDrawColor(228, 232, 238); doc.setLineWidth(0.15); doc.line(cx0, gy, cx1, gy);
     doc.text(`${p}%`, cx0 - 1.5, gy + 1, { align: "right" });
   });
-  const slot = (cx1 - cx0) / RASCH_REQUIRED_ITEMS, bw = slot * 0.72;
+  const slot = (cx1 - cx0) / share.length, bw = slot * 0.72;
   share.forEach((p, i) => {
     const color = p >= 0.7 ? [46, 125, 50] : p >= 0.4 ? [47, 116, 181] : p >= 0.15 ? [237, 125, 49] : [192, 0, 0];
     const bx = cx0 + i * slot + (slot - bw) / 2, h = Math.max(0.3, (cy1 - cy0) * p);
@@ -2250,9 +2251,11 @@ function pdfItemChart(doc, share, overall, yy) {
       doc.setDrawColor(0, 0, 0); doc.setLineWidth(0.5); doc.line(bx - 0.4, oy, bx + bw + 0.4, oy);
     }
     doc.setTextColor(...GREY); doc.setFontSize(4.3);
-    const lb = raschItemLabel(i);
-    if (i < 35) doc.text(lb, bx + bw / 2, cy1 + 3, { align: "center" });
-    else { doc.text(lb.slice(0, 2), bx + bw / 2, cy1 + 3, { align: "center" }); doc.text(lb.slice(2), bx + bw / 2, cy1 + 5.2, { align: "center" }); }
+    const lb = lbOf(i);
+    doc.setFontSize(share.length > 40 ? 4.3 : share.length > 20 ? 5.5 : 6.5);
+    const pi = lb.indexOf("(");
+    if (pi < 0) doc.text(lb, bx + bw / 2, cy1 + 3, { align: "center" });
+    else { doc.text(lb.slice(0, pi), bx + bw / 2, cy1 + 3, { align: "center" }); doc.text(lb.slice(pi), bx + bw / 2, cy1 + 5.2, { align: "center" }); }
   });
   let lx = M; const ly = cy1 + 10;
   [[[46, 125, 50], "70% va yuqori"], [[47, 116, 181], "40–70%"], [[237, 125, 49], "15–40%"], [[192, 0, 0], "15% dan past"]].forEach(([c, t]) => {
@@ -2266,13 +2269,13 @@ function pdfItemChart(doc, share, overall, yy) {
   }
   return ly;
 }
-function pdfItemList(doc, x, y, colW, head, color, list, rightText, pctPos = 0.34, gap = 5.6) {
+function pdfItemList(doc, x, y, colW, head, color, list, rightText, pctPos = 0.34, gap = 5.6, labels = null) {
   const { LINE, GREY, TEXT } = PDF_C;
   doc.setTextColor(...color); doc.setFont(PDF_FONT, "bold"); doc.setFontSize(8.5); doc.text(head, x, y);
   doc.setDrawColor(...LINE); doc.setLineWidth(0.3); doc.line(x, y + 1.8, x + colW, y + 1.8);
   list.forEach((it, k) => {
     const ry = y + 7 + k * gap;
-    doc.setTextColor(...TEXT); doc.setFont(PDF_FONT, "normal"); doc.setFontSize(7.5); doc.text(`${raschItemLabel(it.i)}-savol`, x, ry);
+    doc.setTextColor(...TEXT); doc.setFont(PDF_FONT, "normal"); doc.setFontSize(7.5); doc.text(`${labels ? labels[it.i] : raschItemLabel(it.i)}-savol`, x, ry);
     doc.setFont(PDF_FONT, "bold"); doc.text(`${Math.round(it.p * 100)}%`, x + colW * pctPos, ry);
     doc.setTextColor(...GREY); doc.setFont(PDF_FONT, "normal"); doc.setFontSize(6.5); doc.text(rightText(it), x + colW, ry, { align: "right" });
   });
@@ -2426,6 +2429,93 @@ async function buildOverallReportPdf({ testName, rows, itemShare, itemN }) {
 
   pdfFooters(doc, `Barcha ishtirokchilar · ${testName}`);
   return pdfFinish(doc, `${pdfSafeName(testName)}_${pdfSafeName(cfg.orgName)}.pdf`);
+}
+
+
+// ===== 3) Rash'siz (oddiy) test natijalari hisoboti =====
+// Savollar tartibi bo'yicha band nomlari: 1, 2, 3(a), 3(b) ...
+function testItemLabels(test) {
+  const out = [];
+  (test.questions || []).forEach((q, i) => {
+    if (q.subParts?.length > 0) q.subParts.forEach((_, si) => out.push(`${i + 1}(${String.fromCharCode(97 + si)})`));
+    else out.push(String(i + 1));
+  });
+  return out;
+}
+async function buildPlainResultsPdf({ test, results, title, heading, footer }) {
+  const JsPDF = await loadJsPdf();
+  const cfg = getPdfSettings();
+  const doc = new JsPDF({ unit: "mm", format: "a4" });
+  registerPdfFonts(doc);
+  const { BLUE, LINE, TEXT } = PDF_C, M = PDF_M, CW = PDF_CW;
+  const total = testTotalItems(test) || 1;
+  const users = db.get("users") || [];
+  const rows = results.map(r => {
+    const u = users.find(x => x.phone === r.userPhone);
+    return { name: u ? `${u.firstName} ${u.lastName}` : (r.userName || r.userPhone || ""), group: u?.group || "", score: r.totalScore || 0, pct: Math.round((r.totalScore || 0) / total * 100), time: r.timeTaken, date: r.id, r };
+  }).sort((a, b) => b.score - a.score || (a.time || 1e9) - (b.time || 1e9));
+
+  pdfFirstPageHeader(doc, cfg, { title: title || pdfTitle(test.name), subtitle: "Test natijalari hisoboti", heading: heading || test.name, subheading: "O'quvchilar natijalari" });
+  const cols = [
+    { k: "n", h: "№", w: 10, a: "center" }, { k: "name", h: "Ism Familiya", w: 66, a: "left" }, { k: "group", h: "Guruh", w: 30, a: "left" },
+    { k: "score", h: "To'g'ri", w: 20, a: "center" }, { k: "pct", h: "Foiz", w: 18, a: "center" }, { k: "time", h: "Vaqt", w: 18, a: "center" }, { k: "date", h: "Sana", w: 20, a: "center" },
+  ];
+  const RH = 7.2, HH = 8, BOTTOM = 278;
+  const head = (y) => {
+    doc.setFillColor(...BLUE); doc.rect(M, y, CW, HH, "F");
+    doc.setTextColor(255, 255, 255); doc.setFont(PDF_FONT, "bold"); doc.setFontSize(8.5);
+    let x = M; cols.forEach(c => { doc.text(c.h, x + c.w / 2, y + 5.3, { align: "center" }); x += c.w; });
+    return y + HH;
+  };
+  let y = head(55);
+  rows.forEach((r, i) => {
+    if (y + RH > BOTTOM) { doc.addPage(); y = head(16); }
+    if (i % 2 === 1) { doc.setFillColor(248, 250, 252); doc.rect(M, y, CW, RH, "F"); }
+    doc.setDrawColor(...LINE); doc.setLineWidth(0.2); doc.rect(M, y, CW, RH);
+    const pc = r.pct >= 70 ? [46, 125, 50] : r.pct >= 50 ? [214, 140, 20] : [192, 57, 43];
+    const vals = { n: String(i + 1), name: r.name, group: r.group || "-", score: `${r.score}/${total}`, pct: `${r.pct}%`, time: r.time ? `${r.time} daq` : "-", date: new Date(r.date).toLocaleDateString("uz-UZ") };
+    let x = M;
+    cols.forEach((c, ci) => {
+      if (ci > 0) doc.line(x, y, x, y + RH);
+      if (c.k === "pct" || c.k === "score") { doc.setTextColor(...pc); doc.setFont(PDF_FONT, "bold"); }
+      else { if (c.k === "n") doc.setTextColor(100, 116, 139); else doc.setTextColor(...TEXT); doc.setFont(PDF_FONT, "normal"); }
+      doc.setFontSize(8.3);
+      let t = vals[c.k];
+      if (c.a === "left") { t = doc.splitTextToSize(t, c.w - 4)[0] || ""; doc.text(t, x + 2.5, y + 4.8); }
+      else doc.text(t, x + c.w / 2, y + 4.8, { align: "center" });
+      x += c.w;
+    });
+    y += RH;
+  });
+
+  // Statistika sahifasi
+  doc.addPage();
+  pdfSectionTitle(doc, "Umumiy statistika", 18);
+  const pcts = rows.map(r => r.pct);
+  const avg = pcts.length ? pcts.reduce((a, b) => a + b, 0) / pcts.length : null;
+  const top = rows[0];
+  const good = rows.filter(r => r.pct >= 70).length;
+  pdfStatCards(doc, [
+    ["ISHTIROKCHILAR", String(rows.length), `${total} ta savol`, null],
+    ["O'RTACHA NATIJA", avg != null ? `${avg.toFixed(1)}%` : "-", avg != null ? `o'rtacha ${(avg * total / 100).toFixed(1)} ta to'g'ri` : "", null],
+    ["ENG YUQORI", top ? `${top.score}/${total}` : "-", top?.name || "", null],
+    ["70% VA YUQORI", `${good} ta`, rows.length ? `ishtirokchilarning ${(good / rows.length * 100).toFixed(1)}%` : "", null],
+  ], 25);
+  const labels = testItemLabels(test);
+  const vecs = results.map(r => resultItemVector(test, r)).filter(v => v.length === labels.length);
+  if (vecs.length && labels.length) {
+    const share = labels.map((_, i) => vecs.reduce((a, v) => a + (v[i] ? 1 : 0), 0) / vecs.length);
+    const ly = pdfItemChart(doc, share, null, 58, labels);
+    const yy = ly + 11;
+    const items = share.map((p, i) => ({ i, p }));
+    const colW = (CW - 8) / 2;
+    const solved = (it) => `${Math.round(it.p * vecs.length)} ta o'quvchi to'g'ri yechgan`;
+    const n = Math.min(8, Math.ceil(items.length / 2));
+    pdfItemList(doc, M, yy, colW, "Eng qiyin savollar", [192, 0, 0], [...items].sort((a, b) => a.p - b.p).slice(0, n), solved, 0.3, 5.2, labels);
+    pdfItemList(doc, M + colW + 8, yy, colW, "Eng oson savollar", [46, 125, 50], [...items].sort((a, b) => b.p - a.p).slice(0, n), solved, 0.3, 5.2, labels);
+  }
+  pdfFooters(doc, footer || `${test.name} · natijalar`);
+  return pdfFinish(doc, `${pdfSafeName(heading || test.name)}_natijalar.pdf`);
 }
 
 // ===== BARCHA MARKAZLAR HISOBOTLARI — BITTA ZIP =====
@@ -4995,6 +5085,13 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
   const [adminDocPreview,setAdminDocPreview]=useState(null); // {type:"pdf"|"latex", url?, source?, name}
   const [confirmModal,setConfirmModal]=useState(null);
   const [exportModal,setExportModal]=useState(null); // {dataUrl, filename, tsv, isBinary}
+  const [resPdf,setResPdf]=useState(null); const [resPdfBusy,setResPdfBusy]=useState(false);
+  const plainPdf=async(test,tr)=>{
+    setResPdfBusy(true);
+    try{ setResPdf(await buildPlainResultsPdf({ test, results: tr })); }
+    catch(e){ alert(e.message||"PDF yaratilmadi"); }
+    setResPdfBusy(false);
+  };
   const [regradingId,setRegradingId]=useState(null); // hozir qayta baholanayotgan test id
   const [regradeDoneMsg,setRegradeDoneMsg]=useState(null);
   const [raschModal,setRaschModal]=useState(null); // {test, settings} — sozlamalarni tahrirlash oynasi
@@ -5464,7 +5561,9 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                     <button onClick={()=>setOpenResultTest(null)} style={{...S.btnGhost,padding:"7px 12px"}}>← Barcha testlar</button>
                     <h4 style={{margin:0,color:C.primary,fontSize:16}}>{test.name}</h4>
                     <span style={{...S.badge,background:C.primaryLight,color:C.primary}}>{tr.length} ta topshirdi</span>
+                    {tr.length>0&&<button onClick={()=>plainPdf(test,tr)} disabled={resPdfBusy} style={{...S.btnSmall,background:"#0891B2",padding:"8px 14px",marginLeft:"auto",opacity:resPdfBusy?0.6:1}}>{resPdfBusy?"⏳ Tayyorlanmoqda...":"📄 PDF"}</button>}
                   </div>
+                  <PdfReadyModal pdf={resPdf} onClose={()=>setResPdf(null)}/>
                   {tr.length===0&&<div style={S.empty}>Bu testni hali hech kim topshirmagan</div>}
                   <div style={{overflowX:"auto"}}>
                     <table style={S.table}>
@@ -5797,6 +5896,18 @@ function PartnerPanel({ partnerInfo, onLogout }) {
   const [pdfReady, setPdfReady] = useState(null);
   const [pdfBusyId, setPdfBusyId] = useState(null);
   const [openRes, setOpenRes] = useState({}); // "📊 Natijalarim"da ochilgan test kartalari
+  // Rash'siz test: guruhdagi o'quvchilarning oddiy natijalari PDF'i
+  const plainCenterPdf = async (t, rows) => {
+    const key = "plain_" + t.id;
+    setPdfBusyId(key); setErr(null);
+    try {
+      const centerName = (db.get("partners")||[]).find(p=>p.id===partnerInfo?.id)?.name || "O'quv markazi";
+      const ids = new Set(rows.map(r => r.resultId));
+      const res = (db.get("results")||[]).filter(r => ids.has(r.id));
+      setPdfReady(await buildPlainResultsPdf({ test: t, results: res, heading: centerName, footer: `${centerName} · ${t.name}` }));
+    } catch (e) { setErr(e.message || "PDF yaratishda xatolik yuz berdi."); }
+    setPdfBusyId(null);
+  };
   const toggleRes = (k) => setOpenRes(p => ({ ...p, [k]: !p[k] }));
   // Markaz hisoboti: e'lon qilingan Excel natijalari + markaz guruhidagi saytda topshirganlar (e'lon qilingan Rash)
   const printPDF = async (testId, testName, busyKey) => {
@@ -5979,6 +6090,7 @@ function PartnerPanel({ partnerInfo, onLogout }) {
                             <h4 style={{margin:"0 0 2px",fontSize:14,color:"#0891B2"}}>{t.name} <span style={{fontSize:11,color:C.textMid,display:"inline-block",transform:openRes["site_"+t.id]?"rotate(180deg)":"none",transition:"transform 0.2s"}}>▼</span></h4>
                             <p style={{margin:0,fontSize:11,color:C.textLight}}>{rows.length} o'quvchi • {testTotalItems(t)} savol</p>
                           </div>
+                          {!eligible && <button onClick={()=>plainCenterPdf(t, rows)} disabled={pdfBusyId==="plain_"+t.id} style={{...S.btnSmall,background:"#0891B2",padding:"7px 12px",fontSize:12,opacity:pdfBusyId==="plain_"+t.id?0.6:1}}>{pdfBusyId==="plain_"+t.id?"⏳ Tayyorlanmoqda...":"📄 PDF qilib yuklab olish"}</button>}
                           {eligible && published && !hasBatch && <button onClick={()=>printPDF(t.id, t.name, "site_"+t.id)} disabled={pdfBusyId==="site_"+t.id} style={{...S.btnSmall,background:"#0891B2",padding:"7px 12px",fontSize:12,opacity:pdfBusyId==="site_"+t.id?0.6:1}}>{pdfBusyId==="site_"+t.id?"⏳ Tayyorlanmoqda...":"📄 PDF qilib yuklab olish"}</button>}
                         </div>
                         {eligible && !published && <p style={{margin:"0 0 10px",fontSize:12,color:"#065F46",background:"#ECFDF5",padding:"8px 10px",borderRadius:8}}>✅ Natijalar qabul qilindi. Rash bo'yicha ball tez orada e'lon qilinadi.</p>}
