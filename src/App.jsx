@@ -3903,7 +3903,7 @@ function LoginPage({ onLogin, onRegister, onAdmin, onPartner, onPartnerRegister 
       {err&&<div style={S.err}>{err}</div>}
       <label style={S.label}>Ism Familiya / Markaz nomi</label>
       <input value={login} onChange={e=>setLogin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&go()} style={S.input} placeholder="Masalan: Ali Valiyev"/>
-      <p style={{margin:"-4px 0 10px",fontSize:11.5,color:C.textLight}}>O'quv markazlari — markaz nomini, admin va o'qituvchilar — o'z loginini kiritadi.</p>
+      <p style={{margin:"-4px 0 10px",fontSize:11.5,color:C.textLight}}></p>
       <label style={S.label}>Parol</label>
       <div style={{position:"relative"}}>
         <input type={showPwd?"text":"password"} value={pwd} onChange={e=>setPwd(e.target.value)} onKeyDown={e=>e.key==="Enter"&&go()}
