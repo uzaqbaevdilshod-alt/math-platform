@@ -5081,6 +5081,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
   const [tests,setTests]=useState([]); const [users,setUsers]=useState([]); const [results,setResults]=useState([]);
   const [creating,setCreating]=useState(false); const [editing,setEditing]=useState(null);
   const [openResultTest,setOpenResultTest]=useState(null);
+  const [viewStudentRes,setViewStudentRes]=useState(null); // {result,test,name}
   const [studentsOpen,setStudentsOpen]=useState(false); // "O'quvchilar" ro'yxati — bosganda ochiladi // "Natijalar" bo'limida ochilgan test
   const [adminDocPreview,setAdminDocPreview]=useState(null); // {type:"pdf"|"latex", url?, source?, name}
   const [confirmModal,setConfirmModal]=useState(null);
@@ -5329,6 +5330,7 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
     }});
   };
 
+  if(viewStudentRes) return <ResultDetail result={viewStudentRes.result} test={viewStudentRes.test} studentName={viewStudentRes.name} onBack={()=>setViewStudentRes(null)}/>;
   return (
     <div style={S.page}>
       {confirmModal && <ConfirmModal message={confirmModal.message} confirmLabel={confirmModal.confirmLabel} danger={confirmModal.danger} onConfirm={confirmModal.onConfirm} onCancel={()=>setConfirmModal(null)}/>}
@@ -5574,9 +5576,9 @@ function AdminPanel({ onLogout, isFullAdmin=true, teacherInfo=null }) {
                         const dGrade=r.rasch?.daraja;
                         const dColor=dGrade==="NC"?C.danger:dGrade==="C"||dGrade==="C+"?C.warning:C.successDark;
                         return (
-                          <tr key={r.id} style={{background:i%2===0?C.card:"#FAFBFF"}}>
+                          <tr key={r.id} onClick={()=>setViewStudentRes({result:r,test,name:u?`${u.firstName} ${u.lastName}`:r.userPhone})} title="Javoblarini ko'rish" style={{background:i%2===0?C.card:"#FAFBFF",cursor:"pointer"}}>
                             <td style={S.td}>{i+1}</td>
-                            <td style={S.td}>{u?`${u.firstName} ${u.lastName}`:r.userPhone}</td>
+                            <td style={S.td}><span style={{color:C.primary,fontWeight:700,textDecoration:"underline"}}>{u?`${u.firstName} ${u.lastName}`:r.userPhone}</span></td>
                             <td style={S.td}>{u?.group||"-"}</td>
                             <td style={S.td}><b style={{color:pct>=70?C.successDark:pct>=50?C.warning:C.danger}}>{r.totalScore}</b>/{testTotalItems(test)}</td>
                             <td style={S.td}><span style={{color:pct>=70?C.successDark:pct>=50?C.warning:C.danger,fontWeight:700}}>{pct}%</span></td>
@@ -7208,7 +7210,7 @@ function TestTaking({ test, user, onFinish, onExit }) {
 }
 
 // ===== RESULT DETAIL =====
-function ResultDetail({ result, test, onBack }) {
+function ResultDetail({ result, test, onBack, studentName }) {
   if(!test) return <div style={{padding:24}}><button onClick={onBack}>← Orqaga</button> Test topilmadi.</div>;
   const pct=Math.round((result.totalScore/testTotalItems(test))*100);
   const closedQs=test.questions.filter(q=>q.type==="closed");
@@ -7216,7 +7218,7 @@ function ResultDetail({ result, test, onBack }) {
     <div style={S.page}>
       <div style={{background:C.primary,padding:"14px 20px",display:"flex",alignItems:"center",gap:14,boxShadow:"0 2px 12px rgba(79,110,247,0.3)"}}>
         <button onClick={onBack} style={{...S.btnSmall,background:"rgba(255,255,255,0.2)",color:"white"}}>← Orqaga</button>
-        <h2 style={{margin:0,color:"white",fontSize:17}}>Xatolar Tahlili: {test.name}</h2>
+        <h2 style={{margin:0,color:"white",fontSize:17}}>{studentName?`${studentName} — `:"Xatolar Tahlili: "}{test.name}</h2>
       </div>
       <div style={{padding:20,maxWidth:800,margin:"0 auto"}}>
         <div style={{...S.card,padding:24,textAlign:"center",marginBottom:20}}>
@@ -7252,7 +7254,7 @@ function ResultDetail({ result, test, onBack }) {
             <h3 style={{margin:"0 0 14px",color:C.primary}}>Yopiq Savollar</h3>
             <div style={{overflowX:"auto"}}>
               <table style={S.table}>
-                <thead><tr>{["#","Sizning javob","To'g'ri javob","Natija"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
+                <thead><tr>{["#",studentName?"O'quvchi javobi":"Sizning javob","To'g'ri javob","Natija"].map(h=><th key={h} style={S.th}>{h}</th>)}</tr></thead>
                 <tbody>{closedQs.map((q,i)=>{
                   const ok=result.scores?.[i];
                   return (
