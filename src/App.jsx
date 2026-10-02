@@ -1765,7 +1765,13 @@ function raschComputeCohort(vectors, settings = DEFAULT_RASCH_SETTINGS) {
       alg = (50 + 10 * A.z[k]) * 2 / 3;
       geo = (50 + 10 * G.z[k]) / 3;
       ball = alg + geo;
-      if (ball > 90) ball = (ball - 90) / 100 + 90;
+      if (ball > 90) {
+        // 90 dan oshgan qism: (ball - 90) / 100 + 90. Algebra va Geometriya ham shu nisbatda
+        // kamaytiriladi, shunda ularning yig'indisi doim umumiy ballga teng bo'ladi.
+        const capped = (ball - 90) / 100 + 90;
+        const k = capped / ball;
+        alg *= k; geo *= k; ball = capped;
+      }
     }
     const foiz = ball === null ? null : ball < 46 ? null : ball >= 65 ? 100 : ball / 65 * 100;
     const bmba = foiz === null ? null : 93 * foiz / 100 + 11;
@@ -3903,7 +3909,7 @@ function LoginPage({ onLogin, onRegister, onAdmin, onPartner, onPartnerRegister 
       {err&&<div style={S.err}>{err}</div>}
       <label style={S.label}>Ism Familiya / Markaz nomi</label>
       <input value={login} onChange={e=>setLogin(e.target.value)} onKeyDown={e=>e.key==="Enter"&&go()} style={S.input} placeholder="Masalan: Ali Valiyev"/>
-      <p style={{margin:"-4px 0 10px",fontSize:11.5,color:C.textLight}}></p>
+      <p style={{margin:"-4px 0 10px",fontSize:11.5,color:C.textLight}}>O'quv markazlari — markaz nomini, admin va o'qituvchilar — o'z loginini kiritadi.</p>
       <label style={S.label}>Parol</label>
       <div style={{position:"relative"}}>
         <input type={showPwd?"text":"password"} value={pwd} onChange={e=>setPwd(e.target.value)} onKeyDown={e=>e.key==="Enter"&&go()}
